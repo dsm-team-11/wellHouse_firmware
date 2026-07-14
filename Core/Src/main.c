@@ -64,6 +64,12 @@ typedef enum {
 
 SystemState last_state = STATE_SAFE; // 이전 상태 저장
 SystemState current_state = STATE_SAFE;
+
+// 상태/시간 디바운스 (통신 노이즈로 한두 프레임이 튀어도 출력이 오작동하지 않도록)
+#define STATE_CONFIRM_COUNT 3            // 같은 상태를 연속 3회 받아야 실제 반영
+SystemState pending_state = STATE_SAFE;  // 관찰 중인 후보 상태
+uint8_t state_confirm = 0;               // 후보 상태가 연속으로 확인된 횟수
+uint8_t last_hour = 0xFF, last_minute = 0xFF; // 직전 프레임의 시:분 (7세그 디바운스용)
 // 세그먼트
 uint8_t display[4] = {0, 0, 0, 0};
 
@@ -134,6 +140,11 @@ uint32_t ADC_ReadChannel(uint32_t channel)
 #define GAS_CLOSE_ANGLE     90
 #define WINDOW_CLOSE_ANGLE  70
 
+// 정상(복귀) 위치 각도 — 침수 해소 시 원위치로 복귀. 실제 기구에 맞게 조정하세요.
+#define BREAKER_ON_ANGLE    125   // 차단기 ON
+#define GAS_OPEN_ANGLE      0     // 가스 열림
+#define WINDOW_OPEN_ANGLE   0     // 창문 열림
+
 // 침수 기준 값
 #define SAFE_LEVEL      500   // 500 미만은 물이 없는 상태 (0cm)
 #define WARNING_LEVEL   1200  // 1200 미만은 미세하게 찬 상태 (1~2cm)
@@ -174,14 +185,28 @@ void Servo_SetAngle(uint8_t servo, uint8_t angle)
         Servo_SetAngle(WINDOW_SERVO, WINDOW_CLOSE_ANGLE);
     }
 
+    // 침수가 해소되면 서보를 정상(열림/ON) 위치로 되돌린다
+    void Recovery_Action(void)
+    {
+        Servo_SetAngle(BREAKER_SERVO, BREAKER_ON_ANGLE);
+
+        Servo_SetAngle(GAS_SERVO, GAS_OPEN_ANGLE);
+
+        Servo_SetAngle(WINDOW_SERVO, WINDOW_OPEN_ANGLE);
+    }
+
+    // LED 극성: 이 보드는 active-low 배선(LED- → PA4). HIGH=OFF, LOW=ON 으로 반전.
+    //  (일반 active-high 배선으로 바꾸면 0으로 되돌리세요.)
+    #define LED_ACTIVE_LOW  1
+
     void LED_ON(void)
     {
-        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, LED_ACTIVE_LOW ? GPIO_PIN_RESET : GPIO_PIN_SET);
     }
 
     void LED_OFF(void)
     {
-        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, LED_ACTIVE_LOW ? GPIO_PIN_SET : GPIO_PIN_RESET);
     }
 
     void Buzzer_ON(void)
@@ -247,6 +272,9 @@ int main(void)
     HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
     HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3);
 
+    // 부팅 시 서보를 정상(열림/ON) 위치로 초기화
+    Recovery_Action();
+
 
   //세그먼트
   HAL_TIM_Base_Start_IT(&htim3);
@@ -284,16 +312,43 @@ int main(void)
 	  // 3. ESP32와 SPI 통신 진행 (타임아웃 50ms 설정으로 무한 대기 방지)
 	        if (HAL_SPI_TransmitReceive(&hspi2, spiTx, spiRx, 3, 50) == HAL_OK)
 	        {
-	            // 4. 수신된 데이터 파싱
-	            current_state = (SystemState)spiRx[0]; // 첫 바이트: ESP32가 판단한 수위 상태
+	            // 4. 상태 파싱 + 디바운스
+	            //    유효 범위(0~3)이고, 같은 값이 연속 STATE_CONFIRM_COUNT회 확인될 때만 반영.
+	            //    → 노이즈로 한두 프레임이 ALERT로 튀어도 서보/LED가 헛동작하지 않는다
+	            if (spiRx[0] <= STATE_DANGER)
+	            {
+	                SystemState rx_state = (SystemState)spiRx[0];
+	                if (rx_state == pending_state)
+	                {
+	                    if (state_confirm < STATE_CONFIRM_COUNT) state_confirm++;
+	                }
+	                else
+	                {
+	                    pending_state = rx_state;   // 새 후보 관찰 시작
+	                    state_confirm = 1;
+	                }
+
+	                if (state_confirm >= STATE_CONFIRM_COUNT)
+	                {
+	                    current_state = pending_state; // 연속 확인된 값만 확정 반영
+	                }
+	            }
+
+	            // 5. 7세그먼트 시간: 유효 범위 + 연속 2프레임 일치할 때만 갱신
+	            //    → 튄 프레임 하나가 시계 숫자를 흔드는 것을 방지 (직전 정상값 유지)
 	            uint8_t server_hour = spiRx[1];        // 두 번째 바이트: 시간(Hour)
 	            uint8_t server_minute = spiRx[2];      // 세 번째 바이트: 분(Minute)
 
-	            // 5. 7세그먼트 display 배열에 시간 값 업데이트 (시:분 구조)
-	            display[0] = (server_hour / 10) % 10;
-	            display[1] = server_hour % 10;
-	            display[2] = (server_minute / 10) % 10;
-	            display[3] = server_minute % 10;
+	            if (server_hour <= 23 && server_minute <= 59 &&
+	                server_hour == last_hour && server_minute == last_minute)
+	            {
+	                display[0] = (server_hour / 10) % 10;
+	                display[1] = server_hour % 10;
+	                display[2] = (server_minute / 10) % 10;
+	                display[3] = server_minute % 10;
+	            }
+	            last_hour = server_hour;
+	            last_minute = server_minute;
 	        }
 
 
@@ -302,6 +357,9 @@ int main(void)
 	  	          case STATE_SAFE:
 	  	              Buzzer_OFF();
 	  	              LED_OFF();
+	  	              if (Flood == 1) {        // 직전에 비상 동작했다면 → 서보 원위치 복귀 (1회만)
+	  	                  Recovery_Action();
+	  	              }
 	  	              Flood = 0;
 	  	              break;
 
