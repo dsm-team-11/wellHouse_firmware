@@ -1,0 +1,10 @@
+../Core/Src/soft_i2c.c:6:6:Soft_I2C_Delay	2
+../Core/Src/soft_i2c.c:14:6:SDA_Input	1
+../Core/Src/soft_i2c.c:28:6:SDA_Output	1
+../Core/Src/soft_i2c.c:43:6:Soft_I2C_Start	1
+../Core/Src/soft_i2c.c:60:6:Soft_I2C_Stop	1
+../Core/Src/soft_i2c.c:78:6:Soft_I2C_WriteByte	3
+../Core/Src/soft_i2c.c:106:9:Soft_I2C_WaitACK	3
+../Core/Src/soft_i2c.c:139:6:Soft_I2C_SendACK	1
+../Core/Src/soft_i2c.c:156:6:Soft_I2C_SendNACK	1
+../Core/Src/soft_i2c.c:173:9:Soft_I2C_ReadByte	4
