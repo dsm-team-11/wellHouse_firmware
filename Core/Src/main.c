@@ -19,6 +19,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "adc.h"
+#include "spi.h"
 #include "tim.h"
 #include "gpio.h"
 #include "lcd_i2c.h"
@@ -59,6 +60,32 @@ typedef enum {
 } SystemState;
 
 SystemState last_state = STATE_SAFE; // 이전 상태 저장
+
+// 세그먼트
+uint8_t display[4] = {1,2,3,4};
+
+uint8_t currentDigit = 0;
+
+const uint8_t segTable[10] =
+{
+    0x3F, //0
+    0x06, //1
+    0x5B, //2
+    0x4F, //3
+    0x66, //4
+    0x6D, //5
+    0x7D, //6
+    0x07, //7
+    0x7F, //8
+    0x6F  //9
+};
+
+//spi
+uint8_t spiTx[3];
+uint8_t spiRx[3];
+
+// 서버가 판단한 상태 수신
+	  SystemState current_state = STATE_SAFE;
 
 /* USER CODE END PV */
 
@@ -159,8 +186,6 @@ int main(void)
 
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
-  lcd_print("Water Level");
-  lcd_print("SAFE");
 
   /* USER CODE BEGIN Init */
 
@@ -177,23 +202,29 @@ int main(void)
   MX_GPIO_Init();
   MX_TIM2_Init();
   MX_ADC1_Init();
+  MX_TIM3_Init();
+  MX_SPI2_Init();
   /* USER CODE BEGIN 2 */
   lcd_init();
 
   lcd_init();
 
-  lcd_clear();
-  lcd_setCursor(0,0);
-  lcd_print("Water Level");
+    lcd_clear();
+    lcd_setCursor(0,0);
+    lcd_print("Water Level");
 
-  lcd_setCursor(0,1);
-  lcd_print("SAFE");
+    lcd_setCursor(0,1);
+    lcd_print("SAFE");
 
-  last_state = STATE_SAFE;
+    last_state = STATE_SAFE;
 
-  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
-  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
-  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3);
+    HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
+    HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
+    HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3);
+
+
+  //세그먼트
+  HAL_TIM_Base_Start_IT(&htim3);
 
   /* USER CODE END 2 */
 
@@ -204,89 +235,90 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+
 	  // 물센서 ADC 읽기
 	  HAL_ADC_Start(&hadc1);
-
 	  HAL_ADC_PollForConversion(&hadc1, HAL_MAX_DELAY);
-
 	  waterValue = HAL_ADC_GetValue(&hadc1);
-
 	  HAL_ADC_Stop(&hadc1);
 
-	  SystemState current_state;
+	  // 전송 데이터 구성
+	  spiTx[0] = 0;
+	  spiTx[1] = (waterValue >> 8) & 0xFF;
+	  spiTx[2] = waterValue & 0xFF;
 
+	  // ESP32와 SPI 통신
+//	  HAL_SPI_TransmitReceive(
+//	          &hspi2,
+//	          spiTx,
+//	          spiRx,
+//	          3,
+//	          HAL_MAX_DELAY);
 
-	  // 수위에 따른 상태 결정
-	      if (waterValue < SAFE_LEVEL) {
-	          current_state = STATE_SAFE;
-	      } else if (waterValue < WARNING_LEVEL) {
-	          current_state = STATE_WARNING;
-	      } else if (waterValue < ALERT_LEVEL) { // ALERT_LEVEL(1800~2500) 조건 추가
-	          current_state = STATE_ALERT;
-	      } else {
-	          current_state = STATE_DANGER;
-	      }
+	  // SPI 테스트 전 SAFE 고정
+	  current_state = STATE_SAFE;
 
-	      // 상태에 따른 하드웨어 제어 (부저, LED, 서보)
-	      switch (current_state) {
-	          case STATE_SAFE:
-	              Buzzer_OFF();
-	              LED_OFF();
-	              Flood = 0;
-	              break;
+	  	  //실행 될 코드
+	  	      switch (current_state) {
+	  	          case STATE_SAFE:
+	  	              Buzzer_OFF();
+	  	              LED_OFF();
+	  	              Flood = 0;
+	  	              break;
 
-	          case STATE_WARNING:
-	              Buzzer_OFF();
-	              LED_ON();
-	              // 필요시 조치 추가
-	              break;
+	  	          case STATE_WARNING:
+	  	              Buzzer_OFF();
+	  	              LED_ON();
+	  	              // 필요시 조치 추가
+	  	              break;
 
-	          case STATE_ALERT:
-	              Buzzer_ON();
-	              LED_ON();
-	              // 수위가 높아졌으니 긴급 조치 실행
-	              if(Flood == 0) {
-	                  Emergency_Action();
-	                  Flood = 1;
-	              }
-	              break;
+	  	          case STATE_ALERT:
+	  	              Buzzer_ON();
+	  	              LED_ON();
+	  	              // 수위가 높아졌으니 긴급 조치 실행
+	  	              if(Flood == 0) {
+	  	                  Emergency_Action();
+	  	                  Flood = 1;
+	  	              }
+	  	              break;
 
-	          case STATE_DANGER:
-	              Buzzer_ON();
-	              LED_ON();
-	              if(Flood == 0) {
-	                  Emergency_Action();
-	                  Flood = 1;
-	              }
-	              break;
-	      }
+	  	          case STATE_DANGER:
+	  	              Buzzer_ON();
+	  	              LED_ON();
+	  	              if(Flood == 0) {
+	  	                  Emergency_Action();
+	  	                  Flood = 1;
+	  	              }
+	  	              break;
+	  	      }
 
-	      // 상태가 '변했을 때만' LCD를 새로고침 (깜빡임 방지)
-	      if (current_state != last_state) {
-	          lcd_clear();
-	          switch (current_state) {
-	              case STATE_SAFE:
-	                  lcd_setCursor(0, 0); lcd_print("Water Level");
-	                  lcd_setCursor(0, 1); lcd_print("SAFE");
-	                  break;
-	              case STATE_WARNING:
-	                  lcd_setCursor(0, 0); lcd_print("Water: 2 cm");
-	                  lcd_setCursor(0, 1); lcd_print("WARNING!");
-	                  break;
-	              case STATE_ALERT:
-	                  lcd_setCursor(0, 0); lcd_print("Water: 3 cm");
-	                  lcd_setCursor(0, 1); lcd_print("ALERT!");
-	                  break;
-	              case STATE_DANGER:
-	                  lcd_setCursor(0, 0); lcd_print("Water:10 cm");
-	                  lcd_setCursor(0, 1); lcd_print("DANGER!");
-	                  break;
-	          }
-	          last_state = current_state; // 현재 상태를 이전 상태로 저장
-	      }
+	  	      // 상태가 '변했을 때만' LCD를 새로고침 (깜빡임 방지)
+	  	      if (current_state != last_state) {
+	  	          lcd_clear();
+	  	          switch (current_state) {
+	  	              case STATE_SAFE:
+	  	                  lcd_setCursor(0, 0); lcd_print("Water Level");
+	  	                  lcd_setCursor(0, 1); lcd_print("SAFE");
+	  	                  break;
+	  	              case STATE_WARNING:
+	  	                  lcd_setCursor(0, 0); lcd_print("Water: 2 cm");
+	  	                  lcd_setCursor(0, 1); lcd_print("WARNING!");
+	  	                  break;
+	  	              case STATE_ALERT:
+	  	                  lcd_setCursor(0, 0); lcd_print("Water: 3 cm");
+	  	                  lcd_setCursor(0, 1); lcd_print("ALERT!");
+	  	                  break;
+	  	              case STATE_DANGER:
+	  	                  lcd_setCursor(0, 0); lcd_print("Water:10 cm");
+	  	                  lcd_setCursor(0, 1); lcd_print("DANGER!");
+	  	                  break;
+	  	          }
+	  	          last_state = current_state; // 현재 상태를 이전 상태로 저장
+	  	      }
 
-	      HAL_Delay(200);
-  }
+	  	      HAL_Delay(200);
+	    }
+
   /* USER CODE END 3 */
 }
 
@@ -345,6 +377,62 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+void DisplayDigit(uint8_t digit, uint8_t num)
+{
+    uint8_t seg = segTable[num];
+
+    // 모든 자리 OFF
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7, GPIO_PIN_SET);   // D1
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET);  // D2
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);   // D3
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);   // D4
+
+    // 세그먼트 출력
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_9, (seg & 0x01) ? GPIO_PIN_SET : GPIO_PIN_RESET); // A
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, (seg & 0x02) ? GPIO_PIN_SET : GPIO_PIN_RESET); // B
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_1, (seg & 0x04) ? GPIO_PIN_SET : GPIO_PIN_RESET); // C
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_3, (seg & 0x08) ? GPIO_PIN_SET : GPIO_PIN_RESET); // D
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_2, (seg & 0x10) ? GPIO_PIN_SET : GPIO_PIN_RESET); // E
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, (seg & 0x20) ? GPIO_PIN_SET : GPIO_PIN_RESET); // F
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, (seg & 0x40) ? GPIO_PIN_SET : GPIO_PIN_RESET); // G
+
+    // DP OFF
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_0, GPIO_PIN_RESET);
+
+    // 자리 선택 (LOW = ON)
+    switch(digit)
+    {
+        case 0:
+            HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7, GPIO_PIN_RESET);
+            break;
+
+        case 1:
+            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_RESET);
+            break;
+
+        case 2:
+            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET);
+            break;
+
+        case 3:
+            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);
+            break;
+    }
+}
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if(htim->Instance == TIM3)
+    {
+        DisplayDigit(currentDigit, display[currentDigit]);
+
+        currentDigit++;
+
+        if(currentDigit >= 4)
+            currentDigit = 0;
+    }
+}
 
 /* USER CODE END 4 */
 
