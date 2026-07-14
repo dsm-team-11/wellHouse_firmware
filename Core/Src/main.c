@@ -26,7 +26,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -50,6 +50,9 @@
 
 uint32_t waterValue = 0;
 uint8_t Flood = 0;
+
+// 물센서 3채널 진단용 (SWV 로그 + Live Expressions 관찰용)
+uint32_t adc_in5 = 0, adc_in6 = 0, adc_in7 = 0;
 
 // LCD 깜빡임 방지를 위한 상태 정의
 typedef enum {
@@ -94,6 +97,32 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+// ── 디버그 로그: printf 출력을 SWV(ITM)로 보냄 ───────────────────
+//  STM32CubeIDE 디버그 세션의 [SWV ITM Data Console] port 0 에서 확인
+int __io_putchar(int ch)
+{
+    ITM_SendChar(ch);
+    return ch;
+}
+
+// ── ADC 단일 채널 읽기 헬퍼 ─────────────────────────────────────
+//  Scan/DMA 미사용 구성이므로, 변환 전에 rank1 채널을 매번 재설정한다
+uint32_t ADC_ReadChannel(uint32_t channel)
+{
+    ADC_ChannelConfTypeDef sConfig = {0};
+    sConfig.Channel = channel;
+    sConfig.Rank = 1;
+    // 고임피던스 물센서: 샘플링 시간을 길게 잡아야 채널 간 크로스토크를 막는다
+    sConfig.SamplingTime = ADC_SAMPLETIME_480CYCLES;
+    HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+
+    HAL_ADC_Start(&hadc1);
+    HAL_ADC_PollForConversion(&hadc1, HAL_MAX_DELAY);
+    uint32_t val = HAL_ADC_GetValue(&hadc1);
+    HAL_ADC_Stop(&hadc1);
+    return val;
+}
 
 // 서보 번호
 #define BREAKER_SERVO   1
@@ -232,11 +261,20 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 
-	  // 물센서 ADC 읽기
-	  HAL_ADC_Start(&hadc1);
-	  HAL_ADC_PollForConversion(&hadc1, HAL_MAX_DELAY);
-	  waterValue = HAL_ADC_GetValue(&hadc1);
-	  HAL_ADC_Stop(&hadc1);
+	  // ── 물센서 3채널(IN5/IN6/IN7) 개별 읽기 + 진단 로그 ─────────────
+	  //  IN7(PA7)만 정상이고 IN5/IN6이 오작동인지 확인하기 위한 코드
+	  adc_in5 = ADC_ReadChannel(ADC_CHANNEL_5); // PA5
+	  adc_in6 = ADC_ReadChannel(ADC_CHANNEL_6); // PA6
+	  adc_in7 = ADC_ReadChannel(ADC_CHANNEL_7); // PA7
+
+	  printf("IN5(PA5)=%4lu  IN6(PA6)=%4lu  IN7(PA7)=%4lu\r\n",
+	         (unsigned long)adc_in5, (unsigned long)adc_in6, (unsigned long)adc_in7);
+
+	  // 3개 센서 중 '가장 많이 잠긴(값이 큰)' 센서를 대표 수위로 사용
+	  //  → 어느 센서든 물을 감지하면 시스템이 반응 (침수 보호에 안전한 방향)
+	  waterValue = adc_in5;
+	  if (adc_in6 > waterValue) waterValue = adc_in6;
+	  if (adc_in7 > waterValue) waterValue = adc_in7;
 
 	  // 전송 데이터 구성
 	  spiTx[0] = 0xAA;
