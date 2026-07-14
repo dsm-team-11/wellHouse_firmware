@@ -135,15 +135,16 @@ uint32_t ADC_ReadChannel(uint32_t channel)
 #define GAS_SERVO       2
 #define WINDOW_SERVO    3
 
-// 각도 설정(실험 후 수정)
-#define BREAKER_OFF_ANGLE   35
-#define GAS_CLOSE_ANGLE     90
-#define WINDOW_CLOSE_ANGLE  70
-
-// 정상(복귀) 위치 각도 — 침수 해소 시 원위치로 복귀. 실제 기구에 맞게 조정하세요.
-#define BREAKER_ON_ANGLE    125   // 차단기 ON
+// 가스·창문 서보 각도 (실험 후 수정)
+#define GAS_CLOSE_ANGLE     90    // 가스 잠금
+#define WINDOW_CLOSE_ANGLE  70    // 창문 닫힘
 #define GAS_OPEN_ANGLE      0     // 가스 열림
 #define WINDOW_OPEN_ANGLE   0     // 창문 열림
+
+// 차단기(전기 차단) 서보: 초기 위치에서 반시계로 20°만 움직였다 돌아오는 '플릭' 동작
+#define BREAKER_INIT_ANGLE   90   // 초기(정지) 각도
+#define BREAKER_FLICK_ANGLE  70   // 반시계 20° 위치 (초기-20). 방향이 반대면 110으로 바꾸세요.
+#define BREAKER_FLICK_HOLD   300  // 이동 후 유지 시간(ms)
 
 // 침수 기준 값
 #define SAFE_LEVEL      500   // 500 미만은 물이 없는 상태 (0cm)
@@ -152,6 +153,9 @@ uint32_t ADC_ReadChannel(uint32_t channel)
 #define DANGER_LEVEL    3500  // 그 이상은 위험 상태 (10cm 이상)
 
 //---------------------------------------------
+
+// 각 서보의 현재 각도(논리값)를 추적한다 (천천히 이동시키기 위함). 부팅 시 중앙 90°.
+uint8_t servoAngle[4] = {90, 90, 90, 90};
 
 void Servo_SetAngle(uint8_t servo, uint8_t angle)
 {
@@ -176,28 +180,55 @@ void Servo_SetAngle(uint8_t servo, uint8_t angle)
         }
     }
 
+    // USB 전원 대응 핵심: 현재 위치에서 목표까지 1°씩 '천천히' 이동한다.
+    //  → 급가속/동시 구동으로 인한 순간 전류(inrush)를 없애 brownout을 방지.
+    //  블로킹 함수이므로 Emergency/Recovery에서 순차 호출하면 '한 번에 한 서보'만 움직인다.
+    //  또한 이동할 서보 채널만 그때 PWM을 켠다 → 평상시엔 서보 전원 OFF(전력 최소).
+    void Servo_MoveSlow(uint8_t servo, uint8_t target)
+    {
+        uint32_t ch = (servo == BREAKER_SERVO) ? TIM_CHANNEL_1
+                    : (servo == GAS_SERVO)     ? TIM_CHANNEL_2
+                    :                            TIM_CHANNEL_3;
+        HAL_TIM_PWM_Start(&htim2, ch);   // 이 서보만 켠다 (필요 시점에 지연 시작)
+
+        uint8_t cur = servoAngle[servo];
+        while (cur != target)
+        {
+            cur = (cur < target) ? (uint8_t)(cur + 1) : (uint8_t)(cur - 1);
+            Servo_SetAngle(servo, cur);
+            HAL_Delay(15);   // 스텝 지연: 값을 키우면 더 느리고 전류가 더 낮아진다
+        }
+        servoAngle[servo] = target;
+        // PWM은 유지 → 이동한 위치(닫힘/열림)를 잡고 있게 한다 (안전상 필요).
+    }
+
+    // 차단기: 초기 → 반시계 20° → 초기 (전기 차단 스위치를 한 번 치고 돌아온다)
+    void Breaker_Flick(void)
+    {
+        Servo_MoveSlow(BREAKER_SERVO, BREAKER_FLICK_ANGLE);  // 반시계 20°
+        HAL_Delay(BREAKER_FLICK_HOLD);                       // 잠깐 유지
+        Servo_MoveSlow(BREAKER_SERVO, BREAKER_INIT_ANGLE);   // 초기로 복귀
+    }
+
     void Emergency_Action(void)
     {
-        Servo_SetAngle(BREAKER_SERVO, BREAKER_OFF_ANGLE);
-
-        Servo_SetAngle(GAS_SERVO, GAS_CLOSE_ANGLE);
-
-        Servo_SetAngle(WINDOW_SERVO, WINDOW_CLOSE_ANGLE);
+        // 한 번에 하나씩 (동시·급속 구동 금지 → USB brownout 방지)
+        Breaker_Flick();                                   // 차단기: 반시계 20° 플릭
+        Servo_MoveSlow(GAS_SERVO, GAS_CLOSE_ANGLE);
+        Servo_MoveSlow(WINDOW_SERVO, WINDOW_CLOSE_ANGLE);
     }
 
-    // 침수가 해소되면 서보를 정상(열림/ON) 위치로 되돌린다
+    // 침수가 해소되면 가스·창문을 정상(열림) 위치로 되돌린다 (하나씩 천천히).
+    //  차단기는 Emergency에서 이미 플릭 후 초기 위치로 돌아왔으므로 여기선 제외.
     void Recovery_Action(void)
     {
-        Servo_SetAngle(BREAKER_SERVO, BREAKER_ON_ANGLE);
-
-        Servo_SetAngle(GAS_SERVO, GAS_OPEN_ANGLE);
-
-        Servo_SetAngle(WINDOW_SERVO, WINDOW_OPEN_ANGLE);
+        Servo_MoveSlow(GAS_SERVO, GAS_OPEN_ANGLE);
+        Servo_MoveSlow(WINDOW_SERVO, WINDOW_OPEN_ANGLE);
     }
 
-    // LED 극성: 이 보드는 active-low 배선(LED- → PA4). HIGH=OFF, LOW=ON 으로 반전.
-    //  (일반 active-high 배선으로 바꾸면 0으로 되돌리세요.)
-    #define LED_ACTIVE_LOW  1
+    // LED 극성: 원래(active-high) 동작으로 복귀. HIGH=ON, LOW=OFF.
+    //  (반대로 켜지면 1로 바꾸세요.)
+    #define LED_ACTIVE_LOW  0
 
     void LED_ON(void)
     {
@@ -268,12 +299,8 @@ int main(void)
 
     last_state = STATE_SAFE;
 
-    HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
-    HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
-    HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3);
-
-    // 부팅 시 서보를 정상(열림/ON) 위치로 초기화
-    Recovery_Action();
+    // 부팅 시 서보 PWM을 켜지 않는다 → 평상시 서보 전원 OFF (전력 최소화, brownout 방지).
+    //  서보는 실제 이동이 필요할 때 Servo_MoveSlow가 해당 채널만 그때 켠다.
 
 
   //세그먼트
@@ -289,7 +316,7 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 
-	  // ── 물센서 3채널(IN5/IN6/IN7) 개별 읽기 + 진단 로그 ─────────────
+	  // ── 물센서 3채널(IN5/IN6/IN7) 개별 읽기 + 진단 로그 ────────j─────
 	  //  IN7(PA7)만 정상이고 IN5/IN6이 오작동인지 확인하기 위한 코드
 	  adc_in5 = ADC_ReadChannel(ADC_CHANNEL_5); // PA5
 	  adc_in6 = ADC_ReadChannel(ADC_CHANNEL_6); // PA6
@@ -304,37 +331,39 @@ int main(void)
 	  if (adc_in6 > waterValue) waterValue = adc_in6;
 	  if (adc_in7 > waterValue) waterValue = adc_in7;
 
+	  // ── 상태 판정: STM32가 물센서 값으로 '직접' 등급을 매긴다 ─────────────
+	  //   → ESP32가 없거나 SPI가 끊겨도 LED·부저·서보가 확실히 동작한다.
+	  SystemState rx_state;
+	  if      (waterValue >= DANGER_LEVEL)  rx_state = STATE_DANGER;
+	  else if (waterValue >= ALERT_LEVEL)   rx_state = STATE_ALERT;
+	  else if (waterValue >= WARNING_LEVEL) rx_state = STATE_WARNING;
+	  else                                  rx_state = STATE_SAFE;
+
+	  // 디바운스: 같은 등급이 연속 STATE_CONFIRM_COUNT회일 때만 확정 (센서 노이즈 방어)
+	  if (rx_state == pending_state)
+	  {
+	      if (state_confirm < STATE_CONFIRM_COUNT) state_confirm++;
+	  }
+	  else
+	  {
+	      pending_state = rx_state;
+	      state_confirm = 1;
+	  }
+	  if (state_confirm >= STATE_CONFIRM_COUNT)
+	  {
+	      current_state = pending_state;
+	  }
+
 	  // 전송 데이터 구성
 	  spiTx[0] = 0xAA;
 	  spiTx[1] = (waterValue >> 8) & 0xFF;
 	  spiTx[2] = waterValue & 0xFF;
 
-	  // 3. ESP32와 SPI 통신 진행 (타임아웃 50ms 설정으로 무한 대기 방지)
+	  // ESP32와 SPI 통신 — 상태는 로컬 판정을 쓰므로 spiRx[0]은 무시하고,
+	  //  7세그 시계용 시:분(spiRx[1], spiRx[2])만 받는다.
 	        if (HAL_SPI_TransmitReceive(&hspi2, spiTx, spiRx, 3, 50) == HAL_OK)
 	        {
-	            // 4. 상태 파싱 + 디바운스
-	            //    유효 범위(0~3)이고, 같은 값이 연속 STATE_CONFIRM_COUNT회 확인될 때만 반영.
-	            //    → 노이즈로 한두 프레임이 ALERT로 튀어도 서보/LED가 헛동작하지 않는다
-	            if (spiRx[0] <= STATE_DANGER)
-	            {
-	                SystemState rx_state = (SystemState)spiRx[0];
-	                if (rx_state == pending_state)
-	                {
-	                    if (state_confirm < STATE_CONFIRM_COUNT) state_confirm++;
-	                }
-	                else
-	                {
-	                    pending_state = rx_state;   // 새 후보 관찰 시작
-	                    state_confirm = 1;
-	                }
-
-	                if (state_confirm >= STATE_CONFIRM_COUNT)
-	                {
-	                    current_state = pending_state; // 연속 확인된 값만 확정 반영
-	                }
-	            }
-
-	            // 5. 7세그먼트 시간: 유효 범위 + 연속 2프레임 일치할 때만 갱신
+	            // 7세그먼트 시간: 유효 범위 + 연속 2프레임 일치할 때만 갱신
 	            //    → 튄 프레임 하나가 시계 숫자를 흔드는 것을 방지 (직전 정상값 유지)
 	            uint8_t server_hour = spiRx[1];        // 두 번째 바이트: 시간(Hour)
 	            uint8_t server_minute = spiRx[2];      // 세 번째 바이트: 분(Minute)
