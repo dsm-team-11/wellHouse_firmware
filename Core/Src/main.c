@@ -53,16 +53,16 @@ uint8_t Flood = 0;
 
 // LCD 깜빡임 방지를 위한 상태 정의
 typedef enum {
-    STATE_SAFE,
-    STATE_WARNING,
-    STATE_ALERT,
-    STATE_DANGER
+    STATE_SAFE = 0,
+    STATE_WARNING = 1,
+    STATE_ALERT = 2,
+    STATE_DANGER = 3
 } SystemState;
 
 SystemState last_state = STATE_SAFE; // 이전 상태 저장
-
+SystemState current_state = STATE_SAFE;
 // 세그먼트
-uint8_t display[4] = {1,2,3,4};
+uint8_t display[4] = {0, 0, 0, 0};
 
 uint8_t currentDigit = 0;
 
@@ -80,12 +80,9 @@ const uint8_t segTable[10] =
     0x6F  //9
 };
 
-//spi
+//spi 통신 버퍼
 uint8_t spiTx[3];
 uint8_t spiRx[3];
-
-// 서버가 판단한 상태 수신
-	  SystemState current_state = STATE_SAFE;
 
 /* USER CODE END PV */
 
@@ -205,7 +202,6 @@ int main(void)
   MX_TIM3_Init();
   MX_SPI2_Init();
   /* USER CODE BEGIN 2 */
-  lcd_init();
 
   lcd_init();
 
@@ -243,20 +239,25 @@ int main(void)
 	  HAL_ADC_Stop(&hadc1);
 
 	  // 전송 데이터 구성
-	  spiTx[0] = 0;
+	  spiTx[0] = 0xAA;
 	  spiTx[1] = (waterValue >> 8) & 0xFF;
 	  spiTx[2] = waterValue & 0xFF;
 
-	  // ESP32와 SPI 통신
-//	  HAL_SPI_TransmitReceive(
-//	          &hspi2,
-//	          spiTx,
-//	          spiRx,
-//	          3,
-//	          HAL_MAX_DELAY);
+	  // 3. ESP32와 SPI 통신 진행 (타임아웃 50ms 설정으로 무한 대기 방지)
+	        if (HAL_SPI_TransmitReceive(&hspi2, spiTx, spiRx, 3, 50) == HAL_OK)
+	        {
+	            // 4. 수신된 데이터 파싱
+	            current_state = (SystemState)spiRx[0]; // 첫 바이트: ESP32가 판단한 수위 상태
+	            uint8_t server_hour = spiRx[1];        // 두 번째 바이트: 시간(Hour)
+	            uint8_t server_minute = spiRx[2];      // 세 번째 바이트: 분(Minute)
 
-	  // SPI 테스트 전 SAFE 고정
-	  current_state = STATE_SAFE;
+	            // 5. 7세그먼트 display 배열에 시간 값 업데이트 (시:분 구조)
+	            display[0] = (server_hour / 10) % 10;
+	            display[1] = server_hour % 10;
+	            display[2] = (server_minute / 10) % 10;
+	            display[3] = server_minute % 10;
+	        }
+
 
 	  	  //실행 될 코드
 	  	      switch (current_state) {
@@ -290,6 +291,9 @@ int main(void)
 	  	                  Flood = 1;
 	  	              }
 	  	              break;
+
+	  	        default:
+	  	           break;
 	  	      }
 
 	  	      // 상태가 '변했을 때만' LCD를 새로고침 (깜빡임 방지)
@@ -380,7 +384,9 @@ void SystemClock_Config(void)
 
 void DisplayDigit(uint8_t digit, uint8_t num)
 {
-    uint8_t seg = segTable[num];
+	// 0~9 범위를 벗어나는 데이터 방어코드 추가
+	    if (num > 9) num = 0;
+	    uint8_t seg = segTable[num];
 
     // 모든 자리 OFF
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7, GPIO_PIN_SET);   // D1
@@ -397,8 +403,12 @@ void DisplayDigit(uint8_t digit, uint8_t num)
     HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, (seg & 0x20) ? GPIO_PIN_SET : GPIO_PIN_RESET); // F
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, (seg & 0x40) ? GPIO_PIN_SET : GPIO_PIN_RESET); // G
 
-    // DP OFF
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_0, GPIO_PIN_RESET);
+    // 시간 구분을 위해 두 번째 자리(D2) 뒤의 소수점(DP)을 켜주는 로직 추가
+        if(digit == 1) {
+            HAL_GPIO_WritePin(GPIOC, GPIO_PIN_0, GPIO_PIN_SET); // DP ON
+        } else {
+            HAL_GPIO_WritePin(GPIOC, GPIO_PIN_0, GPIO_PIN_RESET); // DP OFF
+        }
 
     // 자리 선택 (LOW = ON)
     switch(digit)

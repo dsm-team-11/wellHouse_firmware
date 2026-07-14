@@ -5,7 +5,7 @@
 ../Core/Src/main.c:161:10:Buzzer_ON	1
 ../Core/Src/main.c:167:10:Buzzer_OFF	1
 ../Core/Src/main.c:178:5:main	12
-../Core/Src/main.c:329:6:SystemClock_Config	4
-../Core/Src/main.c:381:6:DisplayDigit	5
-../Core/Src/main.c:424:6:HAL_TIM_PeriodElapsedCallback	3
-../Core/Src/main.c:443:6:Error_Handler	1
+../Core/Src/main.c:333:6:SystemClock_Config	4
+../Core/Src/main.c:385:6:DisplayDigit	5
+../Core/Src/main.c:428:6:HAL_TIM_PeriodElapsedCallback	3
+../Core/Src/main.c:447:6:Error_Handler	1
