@@ -69,7 +69,7 @@ SystemState current_state = STATE_SAFE;
 
 // 상태 디바운스 (센서 노이즈로 한두 번 값이 튀어도 출력이 오작동하지 않도록)
 #define STATE_CONFIRM_COUNT 3            // 같은 상태를 연속 3회 받아야 실제 반영
-#define EMERGENCY_WATER_CM  4U           // 부저와 비상 서보가 작동하는 기준 수위
+#define EMERGENCY_WATER_CM  3U           // 부저와 비상 서보가 작동하는 기준 수위
 SystemState pending_state = STATE_SAFE;  // 관찰 중인 후보 상태
 uint8_t state_confirm = 0;               // 후보 상태가 연속으로 확인된 횟수
 uint8_t last_water_cm = 0xFF;
@@ -123,7 +123,7 @@ uint32_t ADC_ReadChannel(uint32_t channel)
 #define WINDOW_SERVO    3
 
 // 가스·창문 서보 각도 (실험 후 수정)
-#define GAS_CLOSE_ANGLE     90    // 가스 잠금
+#define GAS_CLOSE_ANGLE     130   // 가스 잠금
 #define WINDOW_CLOSE_ANGLE  70    // 창문 닫힘
 #define GAS_OPEN_ANGLE      0     // 가스 열림
 #define WINDOW_OPEN_ANGLE   0     // 창문 열림
@@ -470,7 +470,7 @@ int main(void)
 	  	      if (current_state == STATE_SAFE) LED_OFF();
 	  	      else                             LED_ON();
 
-	  	      // 4cm 이상이면 부저를 켜고 차단기·가스 밸브·창문 비상 동작을 한 번 시작한다.
+	  	      // 3cm 이상이면 부저를 켜고 차단기·가스 밸브·창문 비상 동작을 한 번 시작한다.
 	  	      if (display_water_cm >= EMERGENCY_WATER_CM)
 	  	      {
 	  	          Buzzer_ON();
@@ -482,7 +482,7 @@ int main(void)
 	  	      }
 	  	      else
 	  	      {
-	  	          // 4cm 미만으로 내려가면 부저를 끄고 서보를 정상 위치로 복구한다.
+	  	          // 3cm 미만으로 내려가면 부저를 끄고 서보를 정상 위치로 복구한다.
 	  	          Buzzer_OFF();
 	  	          if (Flood == 1 && servo_sequence == SERVO_SEQUENCE_IDLE)
 	  	          {
