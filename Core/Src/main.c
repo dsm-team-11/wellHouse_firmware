@@ -59,35 +59,22 @@ typedef enum {
     STATE_SAFE = 0,
     STATE_WARNING = 1,
     STATE_ALERT = 2,
-    STATE_DANGER = 3
+    STATE_CAUTION = 3,
+    STATE_CRITICAL = 4,
+    STATE_DANGER = 5
 } SystemState;
 
 SystemState last_state = STATE_SAFE; // 이전 상태 저장
 SystemState current_state = STATE_SAFE;
 
-// 상태/시간 디바운스 (통신 노이즈로 한두 프레임이 튀어도 출력이 오작동하지 않도록)
+// 상태 디바운스 (센서 노이즈로 한두 번 값이 튀어도 출력이 오작동하지 않도록)
 #define STATE_CONFIRM_COUNT 3            // 같은 상태를 연속 3회 받아야 실제 반영
+#define EMERGENCY_WATER_CM  4U           // 부저와 비상 서보가 작동하는 기준 수위
 SystemState pending_state = STATE_SAFE;  // 관찰 중인 후보 상태
 uint8_t state_confirm = 0;               // 후보 상태가 연속으로 확인된 횟수
-uint8_t last_hour = 0xFF, last_minute = 0xFF; // 직전 프레임의 시:분 (7세그 디바운스용)
-// 세그먼트
-uint8_t display[4] = {0, 0, 0, 0};
-
-uint8_t currentDigit = 0;
-
-const uint8_t segTable[10] =
-{
-    0x3F, //0
-    0x06, //1
-    0x5B, //2
-    0x4F, //3
-    0x66, //4
-    0x6D, //5
-    0x7D, //6
-    0x07, //7
-    0x7F, //8
-    0x6F  //9
-};
+uint8_t last_water_cm = 0xFF;
+uint8_t current_water_cm = 0;
+uint8_t display_water_cm = 0;  // 확정 상태와 함께 LCD에 반영할 수위
 
 //spi 통신 버퍼
 uint8_t spiTx[3];
@@ -147,15 +134,37 @@ uint32_t ADC_ReadChannel(uint32_t channel)
 #define BREAKER_FLICK_HOLD   300  // 이동 후 유지 시간(ms)
 
 // 침수 기준 값
-#define SAFE_LEVEL      500   // 500 미만은 물이 없는 상태 (0cm)
-#define WARNING_LEVEL   1200  // 1200 미만은 미세하게 찬 상태 (1~2cm)
-#define ALERT_LEVEL     2500  // 2500 미만은 주의 상태 (3~5cm)
-#define DANGER_LEVEL    3500  // 그 이상은 위험 상태 (10cm 이상)
-
 //---------------------------------------------
 
 // 각 서보의 현재 각도(논리값)를 추적한다 (천천히 이동시키기 위함). 부팅 시 중앙 90°.
+// 센서 하나는 약 0~4 cm를 측정한다.
+// ADC 값을 약 1000 단위로 나눈다. 센서 하나의 결과는 0~4cm이다.
+static uint8_t ADC_ToSensorCm(uint32_t adc)
+{
+    if (adc <= 100U)  return 0;
+    if (adc <= 1000U) return 1;
+    if (adc <= 3000U) return 2;
+    if (adc < 3755U)  return 3;
+    return 4; // ADC 3755 이상
+}
+
 uint8_t servoAngle[4] = {90, 90, 90, 90};
+
+typedef enum {
+    SERVO_SEQUENCE_IDLE = 0,
+    SERVO_SEQUENCE_BREAKER_TO_FLICK,
+    SERVO_SEQUENCE_BREAKER_HOLD,
+    SERVO_SEQUENCE_BREAKER_RETURN,
+    SERVO_SEQUENCE_GAS_CLOSE,
+    SERVO_SEQUENCE_WINDOW_CLOSE,
+    SERVO_SEQUENCE_GAS_OPEN,
+    SERVO_SEQUENCE_WINDOW_OPEN
+} ServoSequenceState;
+
+ServoSequenceState servo_sequence = SERVO_SEQUENCE_IDLE;
+uint32_t servo_step_tick = 0;
+uint32_t breaker_hold_tick = 0;
+uint32_t sensor_update_tick = 0;
 
 void Servo_SetAngle(uint8_t servo, uint8_t angle)
 {
@@ -180,50 +189,121 @@ void Servo_SetAngle(uint8_t servo, uint8_t angle)
         }
     }
 
-    // USB 전원 대응 핵심: 현재 위치에서 목표까지 1°씩 '천천히' 이동한다.
-    //  → 급가속/동시 구동으로 인한 순간 전류(inrush)를 없애 brownout을 방지.
-    //  블로킹 함수이므로 Emergency/Recovery에서 순차 호출하면 '한 번에 한 서보'만 움직인다.
-    //  또한 이동할 서보 채널만 그때 PWM을 켠다 → 평상시엔 서보 전원 OFF(전력 최소).
-    void Servo_MoveSlow(uint8_t servo, uint8_t target)
+    // 지정한 서보의 PWM만 시작한다. 서보는 이후에도 목표 위치를 유지한다.
+    static void Servo_Start(uint8_t servo)
     {
-        uint32_t ch = (servo == BREAKER_SERVO) ? TIM_CHANNEL_1
-                    : (servo == GAS_SERVO)     ? TIM_CHANNEL_2
-                    :                            TIM_CHANNEL_3;
-        HAL_TIM_PWM_Start(&htim2, ch);   // 이 서보만 켠다 (필요 시점에 지연 시작)
+        uint32_t channel = (servo == BREAKER_SERVO) ? TIM_CHANNEL_1
+                         : (servo == GAS_SERVO)     ? TIM_CHANNEL_2
+                         :                           TIM_CHANNEL_3;
+        HAL_TIM_PWM_Start(&htim2, channel);
+        Servo_SetAngle(servo, servoAngle[servo]);
+    }
 
-        uint8_t cur = servoAngle[servo];
-        while (cur != target)
+    // 호출할 때마다 목표 방향으로 1°만 이동한다. 목표 도달 시 1을 반환한다.
+    static uint8_t Servo_StepToward(uint8_t servo, uint8_t target)
+    {
+        uint8_t current = servoAngle[servo];
+
+        if (current == target) return 1;
+
+        current = (current < target) ? (uint8_t)(current + 1U)
+                                     : (uint8_t)(current - 1U);
+        servoAngle[servo] = current;
+        Servo_SetAngle(servo, current);
+        return (current == target);
+    }
+
+    // 비상 서보 동작을 시작한다. 실제 이동은 메인 루프의 갱신 함수가 나누어 처리한다.
+    static void Emergency_Action(void)
+    {
+        if (servo_sequence != SERVO_SEQUENCE_IDLE) return;
+
+        servo_sequence = SERVO_SEQUENCE_BREAKER_TO_FLICK;
+        servo_step_tick = HAL_GetTick();
+        Servo_Start(BREAKER_SERVO);
+    }
+
+    // 복구 서보 동작을 시작한다. 차단기는 비상 동작에서 이미 원위치로 복귀한다.
+    static void Recovery_Action(void)
+    {
+        if (servo_sequence != SERVO_SEQUENCE_IDLE) return;
+
+        servo_sequence = SERVO_SEQUENCE_GAS_OPEN;
+        servo_step_tick = HAL_GetTick();
+        Servo_Start(GAS_SERVO);
+    }
+
+    // 15ms마다 한 번 호출 효과를 내어 서보를 하나씩 순차적으로 움직인다.
+    static void Servo_SequenceUpdate(void)
+    {
+        uint32_t now = HAL_GetTick();
+
+        if (servo_sequence == SERVO_SEQUENCE_IDLE) return;
+
+        if (servo_sequence == SERVO_SEQUENCE_BREAKER_HOLD)
         {
-            cur = (cur < target) ? (uint8_t)(cur + 1) : (uint8_t)(cur - 1);
-            Servo_SetAngle(servo, cur);
-            HAL_Delay(15);   // 스텝 지연: 값을 키우면 더 느리고 전류가 더 낮아진다
+            if ((uint32_t)(now - breaker_hold_tick) >= BREAKER_FLICK_HOLD)
+            {
+                servo_sequence = SERVO_SEQUENCE_BREAKER_RETURN;
+                servo_step_tick = now;
+            }
+            return;
         }
-        servoAngle[servo] = target;
-        // PWM은 유지 → 이동한 위치(닫힘/열림)를 잡고 있게 한다 (안전상 필요).
-    }
 
-    // 차단기: 초기 → 반시계 20° → 초기 (전기 차단 스위치를 한 번 치고 돌아온다)
-    void Breaker_Flick(void)
-    {
-        Servo_MoveSlow(BREAKER_SERVO, BREAKER_FLICK_ANGLE);  // 반시계 20°
-        HAL_Delay(BREAKER_FLICK_HOLD);                       // 잠깐 유지
-        Servo_MoveSlow(BREAKER_SERVO, BREAKER_INIT_ANGLE);   // 초기로 복귀
-    }
+        if ((uint32_t)(now - servo_step_tick) < 15U) return;
+        servo_step_tick = now;
 
-    void Emergency_Action(void)
-    {
-        // 한 번에 하나씩 (동시·급속 구동 금지 → USB brownout 방지)
-        Breaker_Flick();                                   // 차단기: 반시계 20° 플릭
-        Servo_MoveSlow(GAS_SERVO, GAS_CLOSE_ANGLE);
-        Servo_MoveSlow(WINDOW_SERVO, WINDOW_CLOSE_ANGLE);
-    }
+        switch (servo_sequence)
+        {
+            case SERVO_SEQUENCE_BREAKER_TO_FLICK:
+                if (Servo_StepToward(BREAKER_SERVO, BREAKER_FLICK_ANGLE))
+                {
+                    servo_sequence = SERVO_SEQUENCE_BREAKER_HOLD;
+                    breaker_hold_tick = now;
+                }
+                break;
 
-    // 침수가 해소되면 가스·창문을 정상(열림) 위치로 되돌린다 (하나씩 천천히).
-    //  차단기는 Emergency에서 이미 플릭 후 초기 위치로 돌아왔으므로 여기선 제외.
-    void Recovery_Action(void)
-    {
-        Servo_MoveSlow(GAS_SERVO, GAS_OPEN_ANGLE);
-        Servo_MoveSlow(WINDOW_SERVO, WINDOW_OPEN_ANGLE);
+            case SERVO_SEQUENCE_BREAKER_RETURN:
+                if (Servo_StepToward(BREAKER_SERVO, BREAKER_INIT_ANGLE))
+                {
+                    servo_sequence = SERVO_SEQUENCE_GAS_CLOSE;
+                    Servo_Start(GAS_SERVO);
+                }
+                break;
+
+            case SERVO_SEQUENCE_GAS_CLOSE:
+                if (Servo_StepToward(GAS_SERVO, GAS_CLOSE_ANGLE))
+                {
+                    servo_sequence = SERVO_SEQUENCE_WINDOW_CLOSE;
+                    Servo_Start(WINDOW_SERVO);
+                }
+                break;
+
+            case SERVO_SEQUENCE_WINDOW_CLOSE:
+                if (Servo_StepToward(WINDOW_SERVO, WINDOW_CLOSE_ANGLE))
+                {
+                    servo_sequence = SERVO_SEQUENCE_IDLE;
+                }
+                break;
+
+            case SERVO_SEQUENCE_GAS_OPEN:
+                if (Servo_StepToward(GAS_SERVO, GAS_OPEN_ANGLE))
+                {
+                    servo_sequence = SERVO_SEQUENCE_WINDOW_OPEN;
+                    Servo_Start(WINDOW_SERVO);
+                }
+                break;
+
+            case SERVO_SEQUENCE_WINDOW_OPEN:
+                if (Servo_StepToward(WINDOW_SERVO, WINDOW_OPEN_ANGLE))
+                {
+                    servo_sequence = SERVO_SEQUENCE_IDLE;
+                }
+                break;
+
+            default:
+                break;
+        }
     }
 
     // LED 극성: 원래(active-high) 동작으로 복귀. HIGH=ON, LOW=OFF.
@@ -284,7 +364,6 @@ int main(void)
   MX_GPIO_Init();
   MX_TIM2_Init();
   MX_ADC1_Init();
-  MX_TIM3_Init();
   MX_SPI2_Init();
   /* USER CODE BEGIN 2 */
 
@@ -292,7 +371,7 @@ int main(void)
 
     lcd_clear();
     lcd_setCursor(0,0);
-    lcd_print("Water Level");
+    lcd_print("Water: 0 cm");
 
     lcd_setCursor(0,1);
     lcd_print("SAFE");
@@ -300,11 +379,8 @@ int main(void)
     last_state = STATE_SAFE;
 
     // 부팅 시 서보 PWM을 켜지 않는다 → 평상시 서보 전원 OFF (전력 최소화, brownout 방지).
-    //  서보는 실제 이동이 필요할 때 Servo_MoveSlow가 해당 채널만 그때 켠다.
+    //  서보는 실제 이동이 필요할 때 해당 채널만 켠다.
 
-
-  //세그먼트
-  HAL_TIM_Base_Start_IT(&htim3);
 
   /* USER CODE END 2 */
 
@@ -315,6 +391,14 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+
+	  // 서보를 조금씩 이동시키면서 메인 루프가 멈추지 않도록 한다.
+	  Servo_SequenceUpdate();
+
+	  // 센서, SPI, 출력 및 LCD 처리는 기존과 같이 200ms 주기로 실행한다.
+	  uint32_t now = HAL_GetTick();
+	  if ((uint32_t)(now - sensor_update_tick) < 200U) continue;
+	  sensor_update_tick = now;
 
 	  // ── 물센서 3채널(IN5/IN6/IN7) 개별 읽기 + 진단 로그 ────────j─────
 	  //  IN7(PA7)만 정상이고 IN5/IN6이 오작동인지 확인하기 위한 코드
@@ -331,13 +415,21 @@ int main(void)
 	  if (adc_in6 > waterValue) waterValue = adc_in6;
 	  if (adc_in7 > waterValue) waterValue = adc_in7;
 
+	  // 센서 세 개가 각각 약 4 cm를 담당하므로 합산 측정 범위는 약 12 cm이다.
+	  current_water_cm = ADC_ToSensorCm(adc_in5)
+	                   + ADC_ToSensorCm(adc_in6)
+	                   + ADC_ToSensorCm(adc_in7);
+	  if (current_water_cm > 10U) current_water_cm = 10U;
+
 	  // ── 상태 판정: STM32가 물센서 값으로 '직접' 등급을 매긴다 ─────────────
 	  //   → ESP32가 없거나 SPI가 끊겨도 LED·부저·서보가 확실히 동작한다.
 	  SystemState rx_state;
-	  if      (waterValue >= DANGER_LEVEL)  rx_state = STATE_DANGER;
-	  else if (waterValue >= ALERT_LEVEL)   rx_state = STATE_ALERT;
-	  else if (waterValue >= WARNING_LEVEL) rx_state = STATE_WARNING;
-	  else                                  rx_state = STATE_SAFE;
+	  if      (current_water_cm >= 10U) rx_state = STATE_DANGER;
+	  else if (current_water_cm >= 7U)  rx_state = STATE_CRITICAL;
+	  else if (current_water_cm >= 5U)  rx_state = STATE_CAUTION;
+	  else if (current_water_cm >= 3U)  rx_state = STATE_ALERT;
+	  else if (current_water_cm >= 1U)  rx_state = STATE_WARNING;
+	  else                              rx_state = STATE_SAFE;
 
 	  // 디바운스: 같은 등급이 연속 STATE_CONFIRM_COUNT회일 때만 확정 (센서 노이즈 방어)
 	  if (rx_state == pending_state)
@@ -354,98 +446,85 @@ int main(void)
 	      current_state = pending_state;
 	  }
 
+	  /*
+	   * LCD의 수위와 상태를 하나의 일관된 화면으로 유지한다.
+	   * 상태 경계를 넘으면 새 상태가 확정될 때까지 기존 표시 수위를 유지하고,
+	   * 확정되는 순간 아래 갱신 구간에서 두 줄을 함께 바꾼다.
+	   * 같은 상태 범위 안에서 수위만 변하면 즉시 표시한다.
+	   */
+	  if (rx_state == current_state)
+	  {
+	      display_water_cm = current_water_cm;
+	  }
+
 	  // 전송 데이터 구성
 	  spiTx[0] = 0xAA;
 	  spiTx[1] = (waterValue >> 8) & 0xFF;
 	  spiTx[2] = waterValue & 0xFF;
 
-	  // ESP32와 SPI 통신 — 상태는 로컬 판정을 쓰므로 spiRx[0]은 무시하고,
-	  //  7세그 시계용 시:분(spiRx[1], spiRx[2])만 받는다.
-	        if (HAL_SPI_TransmitReceive(&hspi2, spiTx, spiRx, 3, 50) == HAL_OK)
-	        {
-	            // 7세그먼트 시간: 유효 범위 + 연속 2프레임 일치할 때만 갱신
-	            //    → 튄 프레임 하나가 시계 숫자를 흔드는 것을 방지 (직전 정상값 유지)
-	            uint8_t server_hour = spiRx[1];        // 두 번째 바이트: 시간(Hour)
-	            uint8_t server_minute = spiRx[2];      // 세 번째 바이트: 분(Minute)
-
-	            if (server_hour <= 23 && server_minute <= 59 &&
-	                server_hour == last_hour && server_minute == last_minute)
-	            {
-	                display[0] = (server_hour / 10) % 10;
-	                display[1] = server_hour % 10;
-	                display[2] = (server_minute / 10) % 10;
-	                display[3] = server_minute % 10;
-	            }
-	            last_hour = server_hour;
-	            last_minute = server_minute;
-	        }
+	  // ESP32에 센서 값을 전송한다. 수신 데이터는 현재 사용하지 않는다.
+	  (void)HAL_SPI_TransmitReceive(&hspi2, spiTx, spiRx, 3, 50);
 
 
-	  	  //실행 될 코드
-	  	      switch (current_state) {
-	  	          case STATE_SAFE:
-	  	              Buzzer_OFF();
-	  	              LED_OFF();
-	  	              if (Flood == 1) {        // 직전에 비상 동작했다면 → 서보 원위치 복귀 (1회만)
-	  	                  Recovery_Action();
-	  	              }
+	  	      // LED는 물이 감지되면 켜고, SAFE 상태에서만 끈다.
+	  	      if (current_state == STATE_SAFE) LED_OFF();
+	  	      else                             LED_ON();
+
+	  	      // 4cm 이상이면 부저를 켜고 차단기·가스 밸브·창문 비상 동작을 한 번 시작한다.
+	  	      if (display_water_cm >= EMERGENCY_WATER_CM)
+	  	      {
+	  	          Buzzer_ON();
+	  	          if (Flood == 0 && servo_sequence == SERVO_SEQUENCE_IDLE)
+	  	          {
+	  	              Emergency_Action();
+	  	              Flood = 1;
+	  	          }
+	  	      }
+	  	      else
+	  	      {
+	  	          // 4cm 미만으로 내려가면 부저를 끄고 서보를 정상 위치로 복구한다.
+	  	          Buzzer_OFF();
+	  	          if (Flood == 1 && servo_sequence == SERVO_SEQUENCE_IDLE)
+	  	          {
+	  	              Recovery_Action();
 	  	              Flood = 0;
-	  	              break;
-
-	  	          case STATE_WARNING:
-	  	              Buzzer_OFF();
-	  	              LED_ON();
-	  	              // 필요시 조치 추가
-	  	              break;
-
-	  	          case STATE_ALERT:
-	  	              Buzzer_ON();
-	  	              LED_ON();
-	  	              // 수위가 높아졌으니 긴급 조치 실행
-	  	              if(Flood == 0) {
-	  	                  Emergency_Action();
-	  	                  Flood = 1;
-	  	              }
-	  	              break;
-
-	  	          case STATE_DANGER:
-	  	              Buzzer_ON();
-	  	              LED_ON();
-	  	              if(Flood == 0) {
-	  	                  Emergency_Action();
-	  	                  Flood = 1;
-	  	              }
-	  	              break;
-
-	  	        default:
-	  	           break;
+	  	          }
 	  	      }
 
-	  	      // 상태가 '변했을 때만' LCD를 새로고침 (깜빡임 방지)
-	  	      if (current_state != last_state) {
+	  	      // 상태 또는 수위가 변했을 때 두 줄을 하나의 화면으로 갱신한다.
+	  	      uint8_t water_cm = display_water_cm;
+	  	      if (current_state != last_state || water_cm != last_water_cm) {
+	  	          char water_text[17];
+	  	          // 작성 중인 첫째/둘째 줄이 따로 보이지 않도록 완성 후 다시 켠다.
+	  	          lcd_sendCommand(0x08); // 화면 끄기
 	  	          lcd_clear();
+	  	          snprintf(water_text, sizeof(water_text), "Water: %u cm", water_cm);
+	  	          lcd_setCursor(0, 0); lcd_print(water_text);
 	  	          switch (current_state) {
 	  	              case STATE_SAFE:
-	  	                  lcd_setCursor(0, 0); lcd_print("Water Level");
 	  	                  lcd_setCursor(0, 1); lcd_print("SAFE");
 	  	                  break;
 	  	              case STATE_WARNING:
-	  	                  lcd_setCursor(0, 0); lcd_print("Water: 2 cm");
 	  	                  lcd_setCursor(0, 1); lcd_print("WARNING!");
 	  	                  break;
 	  	              case STATE_ALERT:
-	  	                  lcd_setCursor(0, 0); lcd_print("Water: 3 cm");
 	  	                  lcd_setCursor(0, 1); lcd_print("ALERT!");
 	  	                  break;
+	  	              case STATE_CAUTION:
+	  	                  lcd_setCursor(0, 1); lcd_print("CAUTION!");
+	  	                  break;
+	  	              case STATE_CRITICAL:
+	  	                  lcd_setCursor(0, 1); lcd_print("CRITICAL!");
+	  	                  break;
 	  	              case STATE_DANGER:
-	  	                  lcd_setCursor(0, 0); lcd_print("Water:10 cm");
 	  	                  lcd_setCursor(0, 1); lcd_print("DANGER!");
 	  	                  break;
 	  	          }
+	  	          lcd_sendCommand(0x0C); // 화면 켜기
 	  	          last_state = current_state; // 현재 상태를 이전 상태로 저장
+	  	          last_water_cm = water_cm;
 	  	      }
 
-	  	      HAL_Delay(200);
 	    }
 
   /* USER CODE END 3 */
@@ -506,68 +585,6 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
-
-void DisplayDigit(uint8_t digit, uint8_t num)
-{
-	// 0~9 범위를 벗어나는 데이터 방어코드 추가
-	    if (num > 9) num = 0;
-	    uint8_t seg = segTable[num];
-
-    // 모든 자리 OFF
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7, GPIO_PIN_SET);   // D1
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET);  // D2
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);   // D3
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);   // D4
-
-    // 세그먼트 출력
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_9, (seg & 0x01) ? GPIO_PIN_SET : GPIO_PIN_RESET); // A
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, (seg & 0x02) ? GPIO_PIN_SET : GPIO_PIN_RESET); // B
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_1, (seg & 0x04) ? GPIO_PIN_SET : GPIO_PIN_RESET); // C
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_3, (seg & 0x08) ? GPIO_PIN_SET : GPIO_PIN_RESET); // D
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_2, (seg & 0x10) ? GPIO_PIN_SET : GPIO_PIN_RESET); // E
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, (seg & 0x20) ? GPIO_PIN_SET : GPIO_PIN_RESET); // F
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, (seg & 0x40) ? GPIO_PIN_SET : GPIO_PIN_RESET); // G
-
-    // 시간 구분을 위해 두 번째 자리(D2) 뒤의 소수점(DP)을 켜주는 로직 추가
-        if(digit == 1) {
-            HAL_GPIO_WritePin(GPIOC, GPIO_PIN_0, GPIO_PIN_SET); // DP ON
-        } else {
-            HAL_GPIO_WritePin(GPIOC, GPIO_PIN_0, GPIO_PIN_RESET); // DP OFF
-        }
-
-    // 자리 선택 (LOW = ON)
-    switch(digit)
-    {
-        case 0:
-            HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7, GPIO_PIN_RESET);
-            break;
-
-        case 1:
-            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_RESET);
-            break;
-
-        case 2:
-            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET);
-            break;
-
-        case 3:
-            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);
-            break;
-    }
-}
-
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
-{
-    if(htim->Instance == TIM3)
-    {
-        DisplayDigit(currentDigit, display[currentDigit]);
-
-        currentDigit++;
-
-        if(currentDigit >= 4)
-            currentDigit = 0;
-    }
-}
 
 /* USER CODE END 4 */
 
