@@ -72,6 +72,7 @@ SystemState current_state = STATE_SAFE;
 #define EMERGENCY_WATER_CM  3U           // 부저와 비상 서보가 작동하는 기준 수위
 SystemState pending_state = STATE_SAFE;  // 관찰 중인 후보 상태
 uint8_t state_confirm = 0;               // 후보 상태가 연속으로 확인된 횟수
+SystemState action_last_state = STATE_SAFE; // ALERT 재진입 감지용 이전 상태
 uint8_t last_water_cm = 0xFF;
 uint8_t current_water_cm = 0;
 uint8_t display_water_cm = 0;  // 확정 상태와 함께 LCD에 반영할 수위
@@ -125,6 +126,7 @@ uint32_t ADC_ReadChannel(uint32_t channel)
 // 가스·창문 서보 각도 (실험 후 수정)
 #define GAS_INIT_ANGLE      0     // 가스 초기 위치
 #define GAS_CLOSE_ANGLE     130   // 가스 잠금
+#define GAS_RETURN_ANGLE    50    // 다음 ALERT 동작을 위한 복귀 위치
 #define WINDOW_CLOSE_ANGLE  70    // 창문 닫힘
 #define WINDOW_OPEN_ANGLE   0     // 창문 열림
 
@@ -142,7 +144,7 @@ uint32_t ADC_ReadChannel(uint32_t channel)
 // 2001~3754: 3 cm, 3755~4095: 4 cm
 static uint8_t ADC_ToSensorCm(uint32_t adc)
 {
-    if (adc <= 400U)  return 0;
+    if (adc <= 500U)  return 0;
     if (adc <= 1500U) return 1;
     if (adc <= 2500U) return 2;
     if (adc < 3755U)  return 3;
@@ -162,6 +164,7 @@ typedef enum {
     SERVO_SEQUENCE_BREAKER_FINAL,
     SERVO_SEQUENCE_GAS_WAIT,
     SERVO_SEQUENCE_GAS_CLOSE,
+    SERVO_SEQUENCE_GAS_RETURN,
     SERVO_SEQUENCE_WINDOW_CLOSE,
     SERVO_SEQUENCE_WINDOW_OPEN
 } ServoSequenceState;
@@ -276,19 +279,12 @@ void Servo_SetAngle(uint8_t servo, uint8_t angle)
     {
         if (servo_sequence != SERVO_SEQUENCE_IDLE) return;
 
-        // 차단기가 이미 동작한 상태면 가스 밸브 단계부터 다시 확실히 실행한다.
-        if (servoAngle[BREAKER_SERVO] == BREAKER_FINAL_ANGLE)
-        {
-            gas_start_tick = HAL_GetTick();
-            servo_sequence = SERVO_SEQUENCE_GAS_WAIT;
-            return;
-        }
-
+        // ALERT에 들어올 때마다 현재 위치에서 차단기 동작 순서를 다시 실행한다.
         servo_sequence = SERVO_SEQUENCE_BREAKER_FIRST;
         Servo_BeginMove(BREAKER_SERVO, BREAKER_FIRST_ANGLE, HAL_GetTick());
     }
 
-    // 복구 시 창문 서보만 원래 위치로 이동한다. 차단기와 가스 밸브 위치는 그대로 유지한다.
+    // 복구 시 창문 서보만 원래 위치로 이동한다. 가스 밸브 위치는 그대로 유지한다.
     static void Recovery_Action(void)
     {
         if (servo_sequence != SERVO_SEQUENCE_IDLE) return;
@@ -335,7 +331,15 @@ void Servo_SetAngle(uint8_t servo, uint8_t angle)
             case SERVO_SEQUENCE_GAS_CLOSE:
                 if (Servo_UpdateMove(now))
                 {
-                    // 가스 밸브는 잠금 위치를 유지하고, 서보 전력 소모를 줄이기 위해 PWM만 끈다.
+                    servo_sequence = SERVO_SEQUENCE_GAS_RETURN;
+                    Servo_BeginMove(GAS_SERVO, GAS_RETURN_ANGLE, now);
+                }
+                break;
+
+            case SERVO_SEQUENCE_GAS_RETURN:
+                if (Servo_UpdateMove(now))
+                {
+                    // 50도 복귀 후 PWM을 끄고 다음 ALERT 동작을 준비한다.
                     HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_2);
                     servo_sequence = SERVO_SEQUENCE_WINDOW_CLOSE;
                     Servo_BeginMove(WINDOW_SERVO, WINDOW_CLOSE_ANGLE, now);
@@ -517,6 +521,14 @@ int main(void)
 	  if (state_confirm >= STATE_CONFIRM_COUNT)
 	  {
 	      current_state = pending_state;
+	  }
+
+	  // 다른 상태에서 ALERT로 다시 들어오면 비상 동작을 새로 시작할 수 있게 재무장한다.
+	  // 진행 중인 서보 시퀀스가 있으면 Flood=0이 유지되어 종료 직후 자동으로 실행된다.
+	  if (current_state != action_last_state)
+	  {
+	      if (current_state == STATE_ALERT) Flood = 0;
+	      action_last_state = current_state;
 	  }
 
 	  /*
