@@ -2,7 +2,7 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body
+  * @brief          : 메인 프로그램 본문
   ******************************************************************************
   * @attention
   *
@@ -16,7 +16,7 @@
   ******************************************************************************
   */
 /* USER CODE END Header */
-/* Includes ------------------------------------------------------------------*/
+/* 헤더 파일 -----------------------------------------------------------------*/
 #include "main.h"
 #include "adc.h"
 #include "spi.h"
@@ -24,34 +24,34 @@
 #include "gpio.h"
 #include "lcd_i2c.h"
 
-/* Private includes ----------------------------------------------------------*/
+/* 전용 헤더 파일 ------------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 /* USER CODE END Includes */
 
-/* Private typedef -----------------------------------------------------------*/
+/* 전용 자료형 정의 ----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
 /* USER CODE END PTD */
 
-/* Private define ------------------------------------------------------------*/
+/* 전용 상수 정의 ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
 /* USER CODE END PD */
 
-/* Private macro -------------------------------------------------------------*/
+/* 전용 매크로 ---------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
 
 /* USER CODE END PM */
 
-/* Private variables ---------------------------------------------------------*/
+/* 전용 변수 -----------------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
 
 uint32_t waterValue = 0;
 uint8_t Flood = 0;
 
-// 물센서 3채널 진단용 (SWV 로그 + Live Expressions 관찰용)
+// 물센서 3채널 진단용(SWV 로그 및 실시간 표현식 관찰용)
 uint32_t adc_in5 = 0, adc_in6 = 0, adc_in7 = 0;
 
 // LCD 깜빡임 방지를 위한 상태 정의
@@ -82,17 +82,17 @@ uint8_t spiRx[3];
 
 /* USER CODE END PV */
 
-/* Private function prototypes -----------------------------------------------*/
+/* 전용 함수 원형 ------------------------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
 
-/* Private user code ---------------------------------------------------------*/
+/* 사용자 전용 코드 ----------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
 // ── 디버그 로그: printf 출력을 SWV(ITM)로 보냄 ───────────────────
-//  STM32CubeIDE 디버그 세션의 [SWV ITM Data Console] port 0 에서 확인
+// STM32CubeIDE 디버그 세션의 [SWV ITM 데이터 콘솔] 0번 포트에서 확인
 int __io_putchar(int ch)
 {
     ITM_SendChar(ch);
@@ -100,7 +100,7 @@ int __io_putchar(int ch)
 }
 
 // ── ADC 단일 채널 읽기 헬퍼 ─────────────────────────────────────
-//  Scan/DMA 미사용 구성이므로, 변환 전에 rank1 채널을 매번 재설정한다
+// 스캔/DMA 미사용 구성이므로 변환 전에 1순위 채널을 매번 재설정한다
 uint32_t ADC_ReadChannel(uint32_t channel)
 {
     ADC_ChannelConfTypeDef sConfig = {0};
@@ -123,15 +123,15 @@ uint32_t ADC_ReadChannel(uint32_t channel)
 #define WINDOW_SERVO    3
 
 // 가스·창문 서보 각도 (실험 후 수정)
+#define GAS_INIT_ANGLE      0     // 가스 초기 위치
 #define GAS_CLOSE_ANGLE     130   // 가스 잠금
 #define WINDOW_CLOSE_ANGLE  70    // 창문 닫힘
-#define GAS_OPEN_ANGLE      0     // 가스 열림
 #define WINDOW_OPEN_ANGLE   0     // 창문 열림
 
-// 차단기(전기 차단) 서보: 초기 위치에서 반시계로 20°만 움직였다 돌아오는 '플릭' 동작
+// 차단기 서보: 초기 위치에서 첫 번째 위치로 이동한 뒤 최종 위치로 이동
 #define BREAKER_INIT_ANGLE   90   // 초기(정지) 각도
-#define BREAKER_FLICK_ANGLE  70   // 반시계 20° 위치 (초기-20). 방향이 반대면 110으로 바꾸세요.
-#define BREAKER_FLICK_HOLD   300  // 이동 후 유지 시간(ms)
+#define BREAKER_FIRST_ANGLE  95  // 첫 번째 이동 위치
+#define BREAKER_FINAL_ANGLE  0   // 최종 위치
 
 // 침수 기준 값
 //---------------------------------------------
@@ -148,29 +148,42 @@ static uint8_t ADC_ToSensorCm(uint32_t adc)
     return 4; // ADC 3755 이상
 }
 
-uint8_t servoAngle[4] = {90, 90, 90, 90};
+uint8_t servoAngle[4] = {90, BREAKER_INIT_ANGLE, GAS_INIT_ANGLE, 90};
+
+#define SERVO_STEP_TIME_MS          15U
+#define BREAKER_STEP_TIME_MS         8U
+#define GAS_START_DELAY_MS          500U
+#define GAS_REASSERT_TIME_MS        500U
 
 typedef enum {
     SERVO_SEQUENCE_IDLE = 0,
-    SERVO_SEQUENCE_BREAKER_TO_FLICK,
-    SERVO_SEQUENCE_BREAKER_HOLD,
-    SERVO_SEQUENCE_BREAKER_RETURN,
+    SERVO_SEQUENCE_BREAKER_FIRST,
+    SERVO_SEQUENCE_BREAKER_FINAL,
+    SERVO_SEQUENCE_GAS_WAIT,
     SERVO_SEQUENCE_GAS_CLOSE,
     SERVO_SEQUENCE_WINDOW_CLOSE,
-    SERVO_SEQUENCE_GAS_OPEN,
     SERVO_SEQUENCE_WINDOW_OPEN
 } ServoSequenceState;
 
 ServoSequenceState servo_sequence = SERVO_SEQUENCE_IDLE;
-uint32_t servo_step_tick = 0;
-uint32_t breaker_hold_tick = 0;
 uint32_t sensor_update_tick = 0;
+uint32_t gas_start_tick = 0;
+
+typedef struct {
+    uint8_t servo;
+    uint8_t start_angle;
+    uint8_t target_angle;
+    uint32_t start_tick;
+    uint32_t duration_ms;
+} ServoMotion;
+
+ServoMotion servo_motion = {0};
 
 void Servo_SetAngle(uint8_t servo, uint8_t angle)
 {
     uint16_t pulse;
 
-    // 0~180° -> 1000~2000us
+    // 0~180°를 1000~2000마이크로초로 변환
     pulse = 1000 + (angle * 1000) / 180;
 
     switch(servo)
@@ -189,28 +202,72 @@ void Servo_SetAngle(uint8_t servo, uint8_t angle)
         }
     }
 
-    // 지정한 서보의 PWM만 시작한다. 서보는 이후에도 목표 위치를 유지한다.
-    static void Servo_Start(uint8_t servo)
+    static uint32_t Servo_Channel(uint8_t servo)
     {
-        uint32_t channel = (servo == BREAKER_SERVO) ? TIM_CHANNEL_1
-                         : (servo == GAS_SERVO)     ? TIM_CHANNEL_2
-                         :                           TIM_CHANNEL_3;
-        HAL_TIM_PWM_Start(&htim2, channel);
-        Servo_SetAngle(servo, servoAngle[servo]);
+        if (servo == BREAKER_SERVO) return TIM_CHANNEL_1;
+        if (servo == GAS_SERVO)     return TIM_CHANNEL_2;
+        return TIM_CHANNEL_3;
     }
 
-    // 호출할 때마다 목표 방향으로 1°만 이동한다. 목표 도달 시 1을 반환한다.
-    static uint8_t Servo_StepToward(uint8_t servo, uint8_t target)
+    /*
+     * 현재 각도에서 목표 각도까지 이동을 예약한다. 이동 각도 1도당 15ms를
+     * 사용하므로 기존 동작 속도는 유지한다.
+     */
+    static void Servo_BeginMove(uint8_t servo, uint8_t target, uint32_t now)
     {
-        uint8_t current = servoAngle[servo];
+        uint8_t start = servoAngle[servo];
+        uint8_t distance = (start < target) ? (uint8_t)(target - start)
+                                            : (uint8_t)(start - target);
 
-        if (current == target) return 1;
+        HAL_TIM_PWM_Start(&htim2, Servo_Channel(servo));
+        Servo_SetAngle(servo, start);
 
-        current = (current < target) ? (uint8_t)(current + 1U)
-                                     : (uint8_t)(current - 1U);
-        servoAngle[servo] = current;
-        Servo_SetAngle(servo, current);
-        return (current == target);
+        servo_motion.servo = servo;
+        servo_motion.start_angle = start;
+        servo_motion.target_angle = target;
+        servo_motion.start_tick = now;
+        uint32_t step_time_ms = (servo == BREAKER_SERVO)
+                              ? BREAKER_STEP_TIME_MS
+                              : SERVO_STEP_TIME_MS;
+        servo_motion.duration_ms = (uint32_t)distance * step_time_ms;
+
+        // 이미 잠금 각도여도 비상 때마다 가스 밸브에 닫힘 신호를 충분히 인가한다.
+        if (servo == GAS_SERVO && servo_motion.duration_ms < GAS_REASSERT_TIME_MS)
+        {
+            servo_motion.duration_ms = GAS_REASSERT_TIME_MS;
+        }
+    }
+
+    /*
+     * 호출 횟수가 아니라 실제 경과시간으로 각도를 계산한다. 메인 루프가 잠시
+     * 지연되어도 반환 동작이 중간에 멈추지 않는다.
+     */
+    static uint8_t Servo_UpdateMove(uint32_t now)
+    {
+        uint32_t elapsed = (uint32_t)(now - servo_motion.start_tick);
+        uint8_t start = servo_motion.start_angle;
+        uint8_t target = servo_motion.target_angle;
+        uint8_t distance = (start < target) ? (uint8_t)(target - start)
+                                            : (uint8_t)(start - target);
+        uint32_t step_time_ms = (servo_motion.servo == BREAKER_SERVO)
+                              ? BREAKER_STEP_TIME_MS
+                              : SERVO_STEP_TIME_MS;
+
+        if (servo_motion.duration_ms == 0U || elapsed >= servo_motion.duration_ms)
+        {
+            servoAngle[servo_motion.servo] = target;
+            Servo_SetAngle(servo_motion.servo, target);
+            return 1U;
+        }
+
+        uint8_t moved = (uint8_t)(elapsed / step_time_ms);
+        if (moved > distance) moved = distance;
+
+        uint8_t angle = (start < target) ? (uint8_t)(start + moved)
+                                         : (uint8_t)(start - moved);
+        servoAngle[servo_motion.servo] = angle;
+        Servo_SetAngle(servo_motion.servo, angle);
+        return 0U;
     }
 
     // 비상 서보 동작을 시작한다. 실제 이동은 메인 루프의 갱신 함수가 나누어 처리한다.
@@ -218,19 +275,26 @@ void Servo_SetAngle(uint8_t servo, uint8_t angle)
     {
         if (servo_sequence != SERVO_SEQUENCE_IDLE) return;
 
-        servo_sequence = SERVO_SEQUENCE_BREAKER_TO_FLICK;
-        servo_step_tick = HAL_GetTick();
-        Servo_Start(BREAKER_SERVO);
+        // 차단기가 이미 OFF라면 다시 왕복시키지 않고 가스 밸브 단계부터 시작한다.
+        // 가스 밸브 닫힘 단계는 모든 비상 동작에서 반드시 실행된다.
+        if (servoAngle[BREAKER_SERVO] == BREAKER_FINAL_ANGLE)
+        {
+            gas_start_tick = HAL_GetTick();
+            servo_sequence = SERVO_SEQUENCE_GAS_WAIT;
+            return;
+        }
+
+        servo_sequence = SERVO_SEQUENCE_BREAKER_FIRST;
+        Servo_BeginMove(BREAKER_SERVO, BREAKER_FIRST_ANGLE, HAL_GetTick());
     }
 
-    // 복구 서보 동작을 시작한다. 차단기는 비상 동작에서 이미 원위치로 복귀한다.
+    // 복구 시 창문 서보만 원래 위치로 이동한다. 차단기와 가스 밸브 위치는 그대로 유지한다.
     static void Recovery_Action(void)
     {
         if (servo_sequence != SERVO_SEQUENCE_IDLE) return;
 
-        servo_sequence = SERVO_SEQUENCE_GAS_OPEN;
-        servo_step_tick = HAL_GetTick();
-        Servo_Start(GAS_SERVO);
+        servo_sequence = SERVO_SEQUENCE_WINDOW_OPEN;
+        Servo_BeginMove(WINDOW_SERVO, WINDOW_OPEN_ANGLE, HAL_GetTick());
     }
 
     // 15ms마다 한 번 호출 효과를 내어 서보를 하나씩 순차적으로 움직인다.
@@ -240,62 +304,52 @@ void Servo_SetAngle(uint8_t servo, uint8_t angle)
 
         if (servo_sequence == SERVO_SEQUENCE_IDLE) return;
 
-        if (servo_sequence == SERVO_SEQUENCE_BREAKER_HOLD)
-        {
-            if ((uint32_t)(now - breaker_hold_tick) >= BREAKER_FLICK_HOLD)
-            {
-                servo_sequence = SERVO_SEQUENCE_BREAKER_RETURN;
-                servo_step_tick = now;
-            }
-            return;
-        }
-
-        if ((uint32_t)(now - servo_step_tick) < 15U) return;
-        servo_step_tick = now;
-
         switch (servo_sequence)
         {
-            case SERVO_SEQUENCE_BREAKER_TO_FLICK:
-                if (Servo_StepToward(BREAKER_SERVO, BREAKER_FLICK_ANGLE))
+            case SERVO_SEQUENCE_BREAKER_FIRST:
+                if (Servo_UpdateMove(now))
                 {
-                    servo_sequence = SERVO_SEQUENCE_BREAKER_HOLD;
-                    breaker_hold_tick = now;
+                    servo_sequence = SERVO_SEQUENCE_BREAKER_FINAL;
+                    Servo_BeginMove(BREAKER_SERVO, BREAKER_FINAL_ANGLE, now);
                 }
                 break;
 
-            case SERVO_SEQUENCE_BREAKER_RETURN:
-                if (Servo_StepToward(BREAKER_SERVO, BREAKER_INIT_ANGLE))
+            case SERVO_SEQUENCE_BREAKER_FINAL:
+                if (Servo_UpdateMove(now))
+                {
+                    HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_1);
+                    gas_start_tick = now;
+                    servo_sequence = SERVO_SEQUENCE_GAS_WAIT;
+                }
+                break;
+
+            case SERVO_SEQUENCE_GAS_WAIT:
+                if ((uint32_t)(now - gas_start_tick) >= GAS_START_DELAY_MS)
                 {
                     servo_sequence = SERVO_SEQUENCE_GAS_CLOSE;
-                    Servo_Start(GAS_SERVO);
+                    Servo_BeginMove(GAS_SERVO, GAS_CLOSE_ANGLE, now);
                 }
                 break;
 
             case SERVO_SEQUENCE_GAS_CLOSE:
-                if (Servo_StepToward(GAS_SERVO, GAS_CLOSE_ANGLE))
+                if (Servo_UpdateMove(now))
                 {
+                    // 가스 밸브는 잠금 위치를 유지하고, 서보 전력 소모를 줄이기 위해 PWM만 끈다.
+                    HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_2);
                     servo_sequence = SERVO_SEQUENCE_WINDOW_CLOSE;
-                    Servo_Start(WINDOW_SERVO);
+                    Servo_BeginMove(WINDOW_SERVO, WINDOW_CLOSE_ANGLE, now);
                 }
                 break;
 
             case SERVO_SEQUENCE_WINDOW_CLOSE:
-                if (Servo_StepToward(WINDOW_SERVO, WINDOW_CLOSE_ANGLE))
+                if (Servo_UpdateMove(now))
                 {
                     servo_sequence = SERVO_SEQUENCE_IDLE;
                 }
                 break;
 
-            case SERVO_SEQUENCE_GAS_OPEN:
-                if (Servo_StepToward(GAS_SERVO, GAS_OPEN_ANGLE))
-                {
-                    servo_sequence = SERVO_SEQUENCE_WINDOW_OPEN;
-                    Servo_Start(WINDOW_SERVO);
-                }
-                break;
-
             case SERVO_SEQUENCE_WINDOW_OPEN:
-                if (Servo_StepToward(WINDOW_SERVO, WINDOW_OPEN_ANGLE))
+                if (Servo_UpdateMove(now))
                 {
                     servo_sequence = SERVO_SEQUENCE_IDLE;
                 }
@@ -306,7 +360,7 @@ void Servo_SetAngle(uint8_t servo, uint8_t angle)
         }
     }
 
-    // LED 극성: 원래(active-high) 동작으로 복귀. HIGH=ON, LOW=OFF.
+    // LED 극성: 원래의 높은 신호 활성 방식으로 복귀. 높음=켜짐, 낮음=꺼짐.
     //  (반대로 켜지면 1로 바꾸세요.)
     #define LED_ACTIVE_LOW  0
 
@@ -334,8 +388,8 @@ void Servo_SetAngle(uint8_t servo, uint8_t angle)
 /* USER CODE END 0 */
 
 /**
-  * @brief  The application entry point.
-  * @retval int
+  * @brief  프로그램 시작 함수
+  * @retval 정수형 반환값
   */
 int main(void)
 {
@@ -344,23 +398,23 @@ int main(void)
 
   /* USER CODE END 1 */
 
-  /* MCU Configuration--------------------------------------------------------*/
+  /* 마이크로컨트롤러 설정 ---------------------------------------------------*/
 
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  /* 모든 주변장치를 초기화하고 플래시 인터페이스와 시스템 틱을 설정한다. */
   HAL_Init();
 
   /* USER CODE BEGIN Init */
 
   /* USER CODE END Init */
 
-  /* Configure the system clock */
+  /* 시스템 클럭 설정 */
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
 
   /* USER CODE END SysInit */
 
-  /* Initialize all configured peripherals */
+  /* 설정된 모든 주변장치 초기화 */
   MX_GPIO_Init();
   MX_TIM2_Init();
   MX_ADC1_Init();
@@ -378,13 +432,13 @@ int main(void)
 
     last_state = STATE_SAFE;
 
-    // 부팅 시 서보 PWM을 켜지 않는다 → 평상시 서보 전원 OFF (전력 최소화, brownout 방지).
+    // 부팅 시 서보 PWM을 켜지 않는다. 평상시 서보 출력을 꺼 전력 소모와 전압 강하를 방지한다.
     //  서보는 실제 이동이 필요할 때 해당 채널만 켠다.
 
 
   /* USER CODE END 2 */
 
-  /* Infinite loop */
+  /* 무한 반복문 */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
@@ -431,7 +485,7 @@ int main(void)
 	  else if (current_water_cm >= 1U)  rx_state = STATE_WARNING;
 	  else                              rx_state = STATE_SAFE;
 
-	  // 디바운스: 같은 등급이 연속 STATE_CONFIRM_COUNT회일 때만 확정 (센서 노이즈 방어)
+	  // 상태 안정화: 같은 등급이 설정 횟수만큼 연속 감지될 때만 확정한다(센서 잡음 방지).
 	  if (rx_state == pending_state)
 	  {
 	      if (state_confirm < STATE_CONFIRM_COUNT) state_confirm++;
@@ -466,7 +520,7 @@ int main(void)
 	  (void)HAL_SPI_TransmitReceive(&hspi2, spiTx, spiRx, 3, 50);
 
 
-	  	      // LED는 물이 감지되면 켜고, SAFE 상태에서만 끈다.
+	  	      // LED는 물이 감지되면 켜고 안전 상태에서만 끈다.
 	  	      if (current_state == STATE_SAFE) LED_OFF();
 	  	      else                             LED_ON();
 
@@ -531,21 +585,20 @@ int main(void)
 }
 
 /**
-  * @brief System Clock Configuration
-  * @retval None
+  * @brief 시스템 클럭 설정
+  * @retval 반환값 없음
   */
 void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-  /** Configure the main internal regulator output voltage
+  /** 주 내부 레귤레이터의 출력 전압을 설정한다.
   */
   __HAL_RCC_PWR_CLK_ENABLE();
   __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
 
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
+  /** 지정된 매개변수와 RCC_OscInitTypeDef 구조체에 따라 RCC 발진기를 초기화한다.
   */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
@@ -562,14 +615,14 @@ void SystemClock_Config(void)
     Error_Handler();
   }
 
-  /** Activate the Over-Drive mode
+  /** 오버드라이브 모드를 활성화한다.
   */
   if (HAL_PWREx_EnableOverDrive() != HAL_OK)
   {
     Error_Handler();
   }
 
-  /** Initializes the CPU, AHB and APB buses clocks
+  /** CPU, AHB 및 APB 버스 클럭을 초기화한다.
   */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
@@ -589,13 +642,13 @@ void SystemClock_Config(void)
 /* USER CODE END 4 */
 
 /**
-  * @brief  This function is executed in case of error occurrence.
-  * @retval None
+  * @brief  오류 발생 시 실행되는 함수
+  * @retval 반환값 없음
   */
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
+  /* HAL 오류 반환 상태를 보고하는 사용자 구현을 추가할 수 있다. */
   __disable_irq();
   while (1)
   {
@@ -604,17 +657,16 @@ void Error_Handler(void)
 }
 #ifdef USE_FULL_ASSERT
 /**
-  * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
-  * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
-  * @retval None
+  * @brief  매개변수 검사 오류가 발생한 소스 파일명과 줄 번호를 보고한다.
+  * @param  file: 소스 파일명을 가리키는 포인터
+  * @param  line: 오류가 발생한 소스 줄 번호
+  * @retval 반환값 없음
   */
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* 파일명과 줄 번호를 보고하는 사용자 구현을 추가할 수 있다.
+     예: printf("잘못된 매개변수 값: 파일 %s, 줄 %d\r\n", file, line) */
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
