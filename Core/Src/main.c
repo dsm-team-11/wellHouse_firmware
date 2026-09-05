@@ -80,6 +80,10 @@ uint8_t display_water_cm = 0;  // 확정 상태와 함께 LCD에 반영할 수�
 uint8_t buzzer_pattern_active = 0;
 uint32_t buzzer_pattern_tick = 0;
 
+/* **adc값 lcd갱신 시작 */
+uint32_t adc_lcd_update_tick = 0; // **adc값 lcd갱신
+/* **adc값 lcd갱신 끝 */
+
 #define BUZZER_BEEP_TIME_MS  400U
 
 //spi 통신 버퍼
@@ -150,9 +154,9 @@ uint32_t ADC_ReadChannel(uint32_t channel)
 static uint8_t ADC_ToSensorCm(uint32_t adc)
 {
     if (adc <= 700U)  return 0;
-    if (adc <= 1700U) return 1;
-    if (adc <= 2800U) return 2;
-    if (adc < 3755U)  return 3;
+    if (adc <= 2750U) return 1;
+    if (adc <= 3400U) return 2;
+    if (adc < 3835U)  return 3;
     return 4;
 }
 
@@ -598,6 +602,17 @@ int main(void)
 	  	          lcd_clear();
 	  	          snprintf(water_text, sizeof(water_text), "Water: %u cm", water_cm);
 	  	          lcd_setCursor(0, 0); lcd_print(water_text);
+
+                  /* **adc값 lcd갱신 시작 */
+                  { // **adc값 lcd갱신
+                      char adc_text[5]; // **adc값 lcd갱신
+                      snprintf(adc_text, sizeof(adc_text), "%04lu", (unsigned long)waterValue); // **adc값 lcd갱신
+                      lcd_setCursor(12, 0); // **adc값 lcd갱신
+                      lcd_print(adc_text); // **adc값 lcd갱신
+                      adc_lcd_update_tick = now; // **adc값 lcd갱신
+                  } // **adc값 lcd갱신
+                  /* **adc값 lcd갱신 끝 */
+
 	  	          switch (current_state) {
 	  	              case STATE_SAFE:
 	  	                  lcd_setCursor(0, 1); lcd_print("SAFE");
@@ -622,6 +637,17 @@ int main(void)
 	  	          last_state = current_state; // 현재 상태를 이전 상태로 저장
 	  	          last_water_cm = water_cm;
 	  	      }
+
+                  /* **adc값 lcd갱신 시작: 마지막 4칸을 1000ms마다 갱신 */
+                  if ((uint32_t)(now - adc_lcd_update_tick) >= 1000U) // **adc값 lcd갱신
+                  { // **adc값 lcd갱신
+                      char adc_text[5]; // **adc값 lcd갱신
+                      snprintf(adc_text, sizeof(adc_text), "%04lu", (unsigned long)waterValue); // **adc값 lcd갱신
+                      lcd_setCursor(12, 0); // **adc값 lcd갱신
+                      lcd_print(adc_text); // **adc값 lcd갱신
+                      adc_lcd_update_tick = now; // **adc값 lcd갱신
+                  } // **adc값 lcd갱신
+                  /* **adc값 lcd갱신 끝 */
 
 	    }
 
