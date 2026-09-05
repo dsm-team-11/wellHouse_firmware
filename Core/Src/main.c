@@ -73,16 +73,12 @@ SystemState current_state = STATE_SAFE;
 SystemState pending_state = STATE_SAFE;  // 관찰 중인 후보 상태
 uint8_t state_confirm = 0;               // 후보 상태가 연속으로 확인된 횟수
 SystemState action_last_state = STATE_SAFE; // ALERT 재진입 감지용 이전 상태
-uint8_t alert_action_pending = 0;        // 낮은 단계에서 ALERT로 상승했을 때만 설정
+uint8_t alert_action_pending = 0;        // SAFE에서 ALERT로 직접 전이했을 때만 설정
 uint8_t last_water_cm = 0xFF;
 uint8_t current_water_cm = 0;
 uint8_t display_water_cm = 0;  // 확정 상태와 함께 LCD에 반영할 수위
 uint8_t buzzer_pattern_active = 0;
 uint32_t buzzer_pattern_tick = 0;
-
-/* **adc값 lcd갱신 시작 */
-uint32_t adc_lcd_update_tick = 0; // **adc값 lcd갱신
-/* **adc값 lcd갱신 끝 */
 
 #define BUZZER_BEEP_TIME_MS  400U
 
@@ -545,12 +541,12 @@ int main(void)
 	      current_state = pending_state;
 	  }
 
-	  // SAFE 또는 WARNING에서 ALERT로 상승할 때만 비상 동작을 재무장한다.
-	  // CAUTION, CRITICAL, DANGER에서 ALERT로 내려온 경우에는 재실행하지 않는다.
+	  // SAFE에서 ALERT로 직접 전이할 때만 비상 동작을 재무장한다.
+	  // WARNING 또는 상위 경보 단계에서 ALERT로 전이하면 재실행하지 않는다.
 	  if (current_state != action_last_state)
 	  {
 	      alert_action_pending = 0U;
-	      if (current_state == STATE_ALERT && action_last_state < STATE_ALERT)
+	      if (current_state == STATE_ALERT && action_last_state == STATE_SAFE)
 	      {
 	          Flood = 0;
 	          alert_action_pending = 1U;
@@ -603,16 +599,6 @@ int main(void)
 	  	          snprintf(water_text, sizeof(water_text), "Water: %u cm", water_cm);
 	  	          lcd_setCursor(0, 0); lcd_print(water_text);
 
-                  /* **adc값 lcd갱신 시작 */
-                  { // **adc값 lcd갱신
-                      char adc_text[5]; // **adc값 lcd갱신
-                      snprintf(adc_text, sizeof(adc_text), "%04lu", (unsigned long)waterValue); // **adc값 lcd갱신
-                      lcd_setCursor(12, 0); // **adc값 lcd갱신
-                      lcd_print(adc_text); // **adc값 lcd갱신
-                      adc_lcd_update_tick = now; // **adc값 lcd갱신
-                  } // **adc값 lcd갱신
-                  /* **adc값 lcd갱신 끝 */
-
 	  	          switch (current_state) {
 	  	              case STATE_SAFE:
 	  	                  lcd_setCursor(0, 1); lcd_print("SAFE");
@@ -637,17 +623,6 @@ int main(void)
 	  	          last_state = current_state; // 현재 상태를 이전 상태로 저장
 	  	          last_water_cm = water_cm;
 	  	      }
-
-                  /* **adc값 lcd갱신 시작: 마지막 4칸을 1000ms마다 갱신 */
-                  if ((uint32_t)(now - adc_lcd_update_tick) >= 1000U) // **adc값 lcd갱신
-                  { // **adc값 lcd갱신
-                      char adc_text[5]; // **adc값 lcd갱신
-                      snprintf(adc_text, sizeof(adc_text), "%04lu", (unsigned long)waterValue); // **adc값 lcd갱신
-                      lcd_setCursor(12, 0); // **adc값 lcd갱신
-                      lcd_print(adc_text); // **adc값 lcd갱신
-                      adc_lcd_update_tick = now; // **adc값 lcd갱신
-                  } // **adc값 lcd갱신
-                  /* **adc값 lcd갱신 끝 */
 
 	    }
 
