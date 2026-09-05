@@ -54,7 +54,7 @@ uint8_t Flood = 0;
 // 물센서 3채널 진단용(SWV 로그 및 실시간 표현식 관찰용)
 uint32_t adc_in5 = 0, adc_in6 = 0, adc_in7 = 0;
 
-// LCD 깜빡임 방지를 위한 상태 정의
+// 수위 구간에 따른 시스템 상태 정의
 typedef enum {
     STATE_SAFE = 0,
     STATE_WARNING = 1,
@@ -73,9 +73,14 @@ SystemState current_state = STATE_SAFE;
 SystemState pending_state = STATE_SAFE;  // 관찰 중인 후보 상태
 uint8_t state_confirm = 0;               // 후보 상태가 연속으로 확인된 횟수
 SystemState action_last_state = STATE_SAFE; // ALERT 재진입 감지용 이전 상태
+uint8_t alert_action_pending = 0;        // 낮은 단계에서 ALERT로 상승했을 때만 설정
 uint8_t last_water_cm = 0xFF;
 uint8_t current_water_cm = 0;
 uint8_t display_water_cm = 0;  // 확정 상태와 함께 LCD에 반영할 수위
+uint8_t buzzer_pattern_active = 0;
+uint32_t buzzer_pattern_tick = 0;
+
+#define BUZZER_BEEP_TIME_MS  400U
 
 //spi 통신 버퍼
 uint8_t spiTx[3];
@@ -126,7 +131,7 @@ uint32_t ADC_ReadChannel(uint32_t channel)
 // 가스·창문 서보 각도 (실험 후 수정)
 #define GAS_INIT_ANGLE      0     // 가스 초기 위치
 #define GAS_CLOSE_ANGLE     130   // 가스 잠금
-#define GAS_RETURN_ANGLE    50    // 다음 ALERT 동작을 위한 복귀 위치
+#define GAS_RETURN_ANGLE    30    // SAFE 상태에서 돌아갈 가스 서보 위치
 #define WINDOW_CLOSE_ANGLE  70    // 창문 닫힘
 #define WINDOW_OPEN_ANGLE   0     // 창문 열림
 
@@ -138,19 +143,20 @@ uint32_t ADC_ReadChannel(uint32_t channel)
 // 침수 기준 값
 //---------------------------------------------
 
-// 각 서보의 현재 각도(논리값)를 추적한다 (천천히 이동시키기 위함). 부팅 시 중앙 90°.
-// PA5, PA6, PA7 센서는 각각 독립적으로 ADC 0~4095를 읽고 0~4 cm를 측정한다.
-// 0~100: 0 cm, 101~1000: 1 cm, 1001~2000: 2 cm,
-// 2001~3754: 3 cm, 3755~4095: 4 cm
+// PA5, PA6, PA7 센서는 각각 ADC 0~4095를 읽어 0~4 cm로 변환한다.
+// 센서 1개 기준: 0~500=0 cm, 501~1700=1 cm, 1701~2900=2 cm,
+//                 2901~3754=3 cm, 3755~4095=4 cm
+// 세 센서의 변환값을 합산하므로 전체 측정 및 LCD 표시 범위는 0~12 cm이다.
 static uint8_t ADC_ToSensorCm(uint32_t adc)
 {
-    if (adc <= 500U)  return 0;
-    if (adc <= 1500U) return 1;
-    if (adc <= 2500U) return 2;
+    if (adc <= 700U)  return 0;
+    if (adc <= 1700U) return 1;
+    if (adc <= 2800U) return 2;
     if (adc < 3755U)  return 3;
     return 4;
 }
 
+// 각 서보의 현재 논리 각도를 저장하여 단계적으로 이동시킨다.
 uint8_t servoAngle[4] = {90, BREAKER_INIT_ANGLE, GAS_INIT_ANGLE, 90};
 
 #define SERVO_STEP_TIME_MS          15U
@@ -214,8 +220,8 @@ void Servo_SetAngle(uint8_t servo, uint8_t angle)
     }
 
     /*
-     * 현재 각도에서 목표 각도까지 이동을 예약한다. 이동 각도 1도당 15ms를
-     * 사용하므로 기존 동작 속도는 유지한다.
+     * 현재 각도에서 목표 각도까지 이동을 예약한다. 차단기 서보는 1도당 8ms,
+     * 가스 및 창문 서보는 1도당 15ms를 사용한다.
      */
     static void Servo_BeginMove(uint8_t servo, uint8_t target, uint32_t now)
     {
@@ -244,7 +250,7 @@ void Servo_SetAngle(uint8_t servo, uint8_t angle)
 
     /*
      * 호출 횟수가 아니라 실제 경과시간으로 각도를 계산한다. 메인 루프가 잠시
-     * 지연되어도 반환 동작이 중간에 멈추지 않는다.
+     * 지연되어도 서보 이동이 중간에 멈추지 않는다.
      */
     static uint8_t Servo_UpdateMove(uint32_t now)
     {
@@ -279,21 +285,21 @@ void Servo_SetAngle(uint8_t servo, uint8_t angle)
     {
         if (servo_sequence != SERVO_SEQUENCE_IDLE) return;
 
-        // ALERT에 들어올 때마다 현재 위치에서 차단기 동작 순서를 다시 실행한다.
+        // 비상 동작이 재무장된 상태에서 경보 수위가 감지되면 차단기부터 순서대로 실행한다.
         servo_sequence = SERVO_SEQUENCE_BREAKER_FIRST;
         Servo_BeginMove(BREAKER_SERVO, BREAKER_FIRST_ANGLE, HAL_GetTick());
     }
 
-    // 복구 시 창문 서보만 원래 위치로 이동한다. 가스 밸브 위치는 그대로 유지한다.
+    // SAFE 상태로 복귀하면 가스 서보를 30도로 되돌린 뒤 창문을 연다.
     static void Recovery_Action(void)
     {
         if (servo_sequence != SERVO_SEQUENCE_IDLE) return;
 
-        servo_sequence = SERVO_SEQUENCE_WINDOW_OPEN;
-        Servo_BeginMove(WINDOW_SERVO, WINDOW_OPEN_ANGLE, HAL_GetTick());
+        servo_sequence = SERVO_SEQUENCE_GAS_RETURN;
+        Servo_BeginMove(GAS_SERVO, GAS_RETURN_ANGLE, HAL_GetTick());
     }
 
-    // 15ms마다 한 번 호출 효과를 내어 서보를 하나씩 순차적으로 움직인다.
+    // 메인 루프에서 반복 호출되어 경과시간에 맞춰 서보를 하나씩 순차적으로 움직인다.
     static void Servo_SequenceUpdate(void)
     {
         uint32_t now = HAL_GetTick();
@@ -331,18 +337,20 @@ void Servo_SetAngle(uint8_t servo, uint8_t angle)
             case SERVO_SEQUENCE_GAS_CLOSE:
                 if (Servo_UpdateMove(now))
                 {
-                    servo_sequence = SERVO_SEQUENCE_GAS_RETURN;
-                    Servo_BeginMove(GAS_SERVO, GAS_RETURN_ANGLE, now);
+                    // 가스 서보의 논리 위치를 130도로 남기고 PWM 출력을 끈다.
+                    HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_2);
+                    servo_sequence = SERVO_SEQUENCE_WINDOW_CLOSE;
+                    Servo_BeginMove(WINDOW_SERVO, WINDOW_CLOSE_ANGLE, now);
                 }
                 break;
 
             case SERVO_SEQUENCE_GAS_RETURN:
                 if (Servo_UpdateMove(now))
                 {
-                    // 50도 복귀 후 PWM을 끄고 다음 ALERT 동작을 준비한다.
+                    // SAFE 복귀 시 30도로 돌아온 뒤 창문도 정상 위치로 복구한다.
                     HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_2);
-                    servo_sequence = SERVO_SEQUENCE_WINDOW_CLOSE;
-                    Servo_BeginMove(WINDOW_SERVO, WINDOW_CLOSE_ANGLE, now);
+                    servo_sequence = SERVO_SEQUENCE_WINDOW_OPEN;
+                    Servo_BeginMove(WINDOW_SERVO, WINDOW_OPEN_ANGLE, now);
                 }
                 break;
 
@@ -365,8 +373,7 @@ void Servo_SetAngle(uint8_t servo, uint8_t angle)
         }
     }
 
-    // LED 극성: 원래의 높은 신호 활성 방식으로 복귀. 높음=켜짐, 낮음=꺼짐.
-    //  (반대로 켜지면 1로 바꾸세요.)
+    // LED 극성: LED_ACTIVE_LOW가 0이면 높음=켜짐, 1이면 낮음=켜짐.
     #define LED_ACTIVE_LOW  0
 
     void LED_ON(void)
@@ -381,13 +388,25 @@ void Servo_SetAngle(uint8_t servo, uint8_t angle)
 
     void Buzzer_ON(void)
     {
-        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);
+        uint32_t now = HAL_GetTick();
 
-        // 부저가 처음 울리는 순간 차단기·가스 밸브·창문 서보도 함께 동작시킨다.
-        if (Flood == 0 && servo_sequence == SERVO_SEQUENCE_IDLE)
+        // 경보 시작 시점을 기준으로 400ms 켜짐, 400ms 꺼짐을 반복한다.
+        if (buzzer_pattern_active == 0U)
+        {
+            buzzer_pattern_active = 1U;
+            buzzer_pattern_tick = now;
+        }
+
+        uint32_t phase = (uint32_t)(now - buzzer_pattern_tick) / BUZZER_BEEP_TIME_MS;
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1,
+                          ((phase & 1U) == 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+
+        // ALERT 상태에서만 차단기·가스 밸브·창문 비상 동작을 시작한다.
+        if (alert_action_pending == 1U && Flood == 0 && servo_sequence == SERVO_SEQUENCE_IDLE)
         {
             Emergency_Action();
             Flood = 1;
+            alert_action_pending = 0U;
         }
     }
 
@@ -395,9 +414,10 @@ void Servo_SetAngle(uint8_t servo, uint8_t angle)
     void Buzzer_OFF(void)
     {
         HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET);
+        buzzer_pattern_active = 0U;
 
-        // 경보가 해제되면 진행 중인 비상 동작을 마친 뒤 창문 서보를 복구한다.
-        if (Flood == 1 && servo_sequence == SERVO_SEQUENCE_IDLE)
+        // SAFE 상태가 되면 진행 중인 비상 동작을 마친 뒤 서보를 복구한다.
+        if (current_state == STATE_SAFE && Flood == 1 && servo_sequence == SERVO_SEQUENCE_IDLE)
         {
             Recovery_Action();
             Flood = 0;
@@ -451,8 +471,7 @@ int main(void)
 
     last_state = STATE_SAFE;
 
-    // 부팅 시 서보 PWM을 켜지 않는다. 평상시 서보 출력을 꺼 전력 소모와 전압 강하를 방지한다.
-    //  서보는 실제 이동이 필요할 때 해당 채널만 켠다.
+    // 부팅 시 서보 PWM을 시작하지 않는다. 각 채널은 이동 시작 시 개별적으로 켜진다.
 
 
   /* USER CODE END 2 */
@@ -468,13 +487,13 @@ int main(void)
 	  // 서보를 조금씩 이동시키면서 메인 루프가 멈추지 않도록 한다.
 	  Servo_SequenceUpdate();
 
-	  // 센서, SPI, 출력 및 LCD 처리는 기존과 같이 200ms 주기로 실행한다.
+	  // 센서, SPI, 출력 및 LCD 처리를 200ms 주기로 실행한다.
 	  uint32_t now = HAL_GetTick();
 	  if ((uint32_t)(now - sensor_update_tick) < 200U) continue;
 	  sensor_update_tick = now;
 
-	  // ── 물센서 3채널(IN5/IN6/IN7) 개별 읽기 + 진단 로그 ────────j─────
-	  //  IN7(PA7)만 정상이고 IN5/IN6이 오작동인지 확인하기 위한 코드
+	  // ── 물센서 3채널(IN5/IN6/IN7) 개별 읽기 및 진단 로그 ─────────────
+	  // 각 채널의 ADC 값을 개별적으로 확인하기 위한 코드
 	  adc_in5 = ADC_ReadChannel(ADC_CHANNEL_5); // PA5
 	  adc_in6 = ADC_ReadChannel(ADC_CHANNEL_6); // PA6
 	  adc_in7 = ADC_ReadChannel(ADC_CHANNEL_7); // PA7
@@ -482,17 +501,16 @@ int main(void)
 	  printf("IN5(PA5)=%4lu  IN6(PA6)=%4lu  IN7(PA7)=%4lu\r\n",
 	         (unsigned long)adc_in5, (unsigned long)adc_in6, (unsigned long)adc_in7);
 
-	  // 3개 센서 중 '가장 많이 잠긴(값이 큰)' 센서를 대표 수위로 사용
-	  //  → 어느 센서든 물을 감지하면 시스템이 반응 (침수 보호에 안전한 방향)
+	  // 세 센서 중 ADC 값이 가장 큰 채널을 ESP32 전송용 대표 원시값으로 사용한다.
 	  waterValue = adc_in5;
 	  if (adc_in6 > waterValue) waterValue = adc_in6;
 	  if (adc_in7 > waterValue) waterValue = adc_in7;
 
-	  // 센서 세 개가 각각 약 4 cm를 담당하므로 합산 측정 범위는 약 12 cm이다.
+	  // 세 센서의 0~4 cm 변환값을 합산하므로 측정 범위는 0~12 cm이다.
 	  current_water_cm = ADC_ToSensorCm(adc_in5)
 	                   + ADC_ToSensorCm(adc_in6)
 	                   + ADC_ToSensorCm(adc_in7);
-	  if (current_water_cm > 10U) current_water_cm = 10U;
+	  if (current_water_cm > 12U) current_water_cm = 12U;
 
 	  printf("CM: PA5=%u PA6=%u PA7=%u TOTAL=%u\r\n",
 	         ADC_ToSensorCm(adc_in5), ADC_ToSensorCm(adc_in6),
@@ -523,11 +541,16 @@ int main(void)
 	      current_state = pending_state;
 	  }
 
-	  // 다른 상태에서 ALERT로 다시 들어오면 비상 동작을 새로 시작할 수 있게 재무장한다.
-	  // 진행 중인 서보 시퀀스가 있으면 Flood=0이 유지되어 종료 직후 자동으로 실행된다.
+	  // SAFE 또는 WARNING에서 ALERT로 상승할 때만 비상 동작을 재무장한다.
+	  // CAUTION, CRITICAL, DANGER에서 ALERT로 내려온 경우에는 재실행하지 않는다.
 	  if (current_state != action_last_state)
 	  {
-	      if (current_state == STATE_ALERT) Flood = 0;
+	      alert_action_pending = 0U;
+	      if (current_state == STATE_ALERT && action_last_state < STATE_ALERT)
+	      {
+	          Flood = 0;
+	          alert_action_pending = 1U;
+	      }
 	      action_last_state = current_state;
 	  }
 
@@ -562,7 +585,7 @@ int main(void)
 	  	      }
 	  	      else
 	  	      {
-	  	          // 3cm 미만으로 내려가면 부저를 끄고 서보를 정상 위치로 복구한다.
+                  // 3cm 미만이면 부저를 끄며, 서보 복구는 SAFE 상태에서만 실행한다.
 	  	          Buzzer_OFF();
 	  	      }
 
